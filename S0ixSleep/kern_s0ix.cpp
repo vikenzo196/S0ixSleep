@@ -14,12 +14,19 @@
 //  boot CPU waits in a low power state, polling the ACPI event registers, until a wake event shows up:
 //  power button, RTC alarm, or a general purpose event (GPE) that the OS armed for wake (lid, EC, ...).
 //  Then it returns, and XNU runs its normal resume path (acpi_sleep_kernel "returns if sleep failed").
-//  Devices were powered down by their drivers, so the package can still reach a low power state; the
-//  waiting core runs at its lowest HWP performance level and waits in TPAUSE (C0.2) when the CPU has it.
+//  Devices were powered down by their drivers, so the package can still reach a low power state.
 //
-//  Interrupts cannot end the wait: XNU has already shut the local APIC of this CPU down, so the event
-//  registers are polled about every millisecond (PM1 status, GPE0 status against GPE0 enable). Ports
-//  come from the FADT (PM1a_EVT_BLK, GPE0_BLK) and, for the embedded controller, the ECDT or 0x62/0x66.
+//  The wait. XNU has shut the local APIC of this CPU down, so no interrupt arrives by itself: the event
+//  registers are polled (PM1 status, GPE0 status against GPE0 enable). Ports come from the FADT
+//  (PM1a_EVT_BLK, GPE0_BLK) and, for the embedded controller, the ECDT or 0x62/0x66. Between polls:
+//   wait 2 (MWAIT): the core sleeps in MWAIT C10 until the LAPIC timer fires (debug.s0ix.period ms, default 50).
+//     The APIC is enabled for the wait in the mode the kernel uses, its timer (TSC deadline mode) points at
+//     vector 0xF2 of a copy of the kernel's IDT whose gate only sends EOI, and the task priority is 0xE0, so no
+//     kernel vector can be delivered. Everything is put back exactly as found before returning. With the core
+//     in C7 the package can leave PC0 (Galaxy Book3 Ultra: PC3 98% of the time, 2.9 W -> 1.85 W).
+//   wait 1 (TPAUSE): TPAUSE C0.2 for ~1 ms. Simple, but C0.2 is C0: the package stays in PC0.
+//   wait 0: PAUSE loop (debugging only).
+//  With wait >= 1 the core's HWP request is set to its lowest performance level for the wait.
 //
 //  EC events. The EC's own GPE (_GPE of the PNP0C09 device) fires for every EC event: battery, AC,
 //  thermal, fans, as well as the lid and the key that should wake us. When it rises with no keyboard
@@ -47,6 +54,45 @@
 #include <sys/sysctl.h>
 
 #include "kern_s0ix.hpp"
+
+// Gate of the LAPIC timer vector used by the MWAIT wait: count, EOI (xAPIC MMIO or x2APIC MSR), iretq.
+extern "C" {
+__attribute__((used)) volatile uint32_t gS0ixTimerIrqs = 0;
+__attribute__((used)) volatile uint64_t gS0ixEoi = 0;   // xAPIC: virtual address of the EOI register; 0: x2APIC
+void s0ixTimerGate();
+void s0ixSpuriousGate();
+}
+asm(R"(
+	.section __TEXT,__text,regular,pure_instructions
+	.p2align 4
+	.private_extern _s0ixTimerGate
+_s0ixTimerGate:
+	.byte 0xf3, 0x0f, 0x1e, 0xfa
+	pushq %rax
+	pushq %rcx
+	pushq %rdx
+	lock incl _gS0ixTimerIrqs(%rip)
+	movq _gS0ixEoi(%rip), %rax
+	testq %rax, %rax
+	jz 1f
+	movl $0, (%rax)
+	jmp 2f
+1:
+	movl $0x80B, %ecx
+	xorl %eax, %eax
+	xorl %edx, %edx
+	wrmsr
+2:
+	popq %rdx
+	popq %rcx
+	popq %rax
+	iretq
+	.p2align 4
+	.private_extern _s0ixSpuriousGate
+_s0ixSpuriousGate:
+	.byte 0xf3, 0x0f, 0x1e, 0xfa
+	iretq
+)");
 
 namespace {
 
@@ -76,7 +122,8 @@ struct AcpiTables : public IOACPIPlatformExpert {
 
 // ─── configuration (sysctl debug.s0ix.*) ────────────────────────────────────────────────────────
 int enabled = 0;        // 1 = replace the S3 entry with the s0ix wait
-int waitMode = 1;       // 1 = HWP floor + TPAUSE, 0 = PAUSE spin
+int waitMode = 1;       // 2 = MWAIT + LAPIC timer, 1 = TPAUSE, 0 = PAUSE spin (all >= 1 with the HWP floor)
+int periodMs = 50;      // wait 2: LAPIC timer period
 int safetySec = 0;      // wake by itself after N seconds (0 = never)
 int gtReset = 0;        // 1 = reset the Intel GT before returning (Gen12+, see README)
 uint32_t ecIgnore[8], ecWake[8];
@@ -98,6 +145,7 @@ mach_vm_address_t orgAcpiSleep = 0, requestUserActive = 0;
 int route = 0;
 uint32_t lastReason = 0, ecIgnored = 0, ecLast[4] = {0x1FF, 0x1FF, 0x1FF, 0x1FF}, userWakes = 0, gtResult = 0;
 uint64_t lastLoops = 0, lastMs = 0, lastPkgMw = 0, lastCoreMw = 0, lastHwp = 0;
+uint32_t lastMwait = 0;   // 1 = last wait used MWAIT, 2 = asked for but not entered (see mwait_fail)
 uint8_t gpeEn[MaxGpeBytes];
 volatile bool userWakePending = false;
 thread_call_t userWakeCall = nullptr;
@@ -189,6 +237,8 @@ void mapGt() {
 	it->release();
 }
 
+void probeResidency();
+
 bool prepare() {
 	if (!platformReady) platformReady = readPlatform();
 	if (!platformReady) return false;
@@ -213,6 +263,7 @@ bool prepare() {
 		if (ns) tscPerMs = (t1 - t0) * 1000000ULL / ns;
 	}
 	if (gtReset) mapGt();
+	probeResidency();
 	return true;
 }
 
@@ -232,6 +283,121 @@ void resetGt() {
 	while ((*gdrst & 1U) && n < 2000) { spin(2000); n++; }
 	gtResult = (*gdrst & 1U) ? 0x80000000U | n : n + 1;
 	for (auto &f : fw) *reg(f[0]) = 0x00010000U;
+}
+
+// ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
+constexpr uint8_t TimerVector = 0xF2, SpuriousVector = 0xFF;
+alignas(4096) uint8_t idtCopy[4096];
+alignas(64) volatile uint64_t monitorLine[8];
+IOMemoryMap *apicMap = nullptr;
+volatile uint32_t *apicMmio = nullptr;   // xAPIC page; nullptr: x2APIC MSRs
+bool mwaitReady = false;
+uint32_t mwaitFail = 0, mwaitIrqs = 0;
+uint64_t apicFound = 0, coreC7Ms = 0;
+mach_vm_address_t rdmsrCarefully = 0;
+// Package C-state residency: PC2 PC3 PC6 PC7 PC8 PC9 PC10, probed with rdmsr_carefully.
+constexpr uint32_t ResMsr[7] = {0x60D, 0x3F8, 0x3F9, 0x3FA, 0x630, 0x631, 0x632};
+uint32_t resOk = 0, resPm[7];   // bits 0-6 ResMsr, 7 core C7 residency 0x3FE, 31 probed
+
+struct __attribute__((packed)) Idtr { uint16_t limit; uint64_t base; };
+struct ApicSave { Idtr idt; uint64_t base, deadline; uint32_t svr, lvt, tpr; };
+
+uint32_t apicRead(unsigned off) { return apicMmio ? apicMmio[off / 4] : (uint32_t)rdmsr(0x800 + off / 16); }
+void apicWrite(unsigned off, uint32_t v) { if (apicMmio) apicMmio[off / 4] = v; else wrmsr(0x800 + off / 16, v); }
+
+void setGate(uint8_t vector, uint64_t handler, uint16_t cs) {
+	uint8_t *g = idtCopy + vector * 16;
+	g[0] = (uint8_t)handler; g[1] = (uint8_t)(handler >> 8); g[2] = (uint8_t)cs; g[3] = (uint8_t)(cs >> 8);
+	g[4] = 0; g[5] = 0x8E;   // IST 0; present, DPL 0, 64-bit interrupt gate
+	g[6] = (uint8_t)(handler >> 16); g[7] = (uint8_t)(handler >> 24);
+	for (unsigned i = 0; i < 4; i++) g[8 + i] = (uint8_t)(handler >> (32 + 8 * i));
+	g[12] = g[13] = g[14] = g[15] = 0;
+}
+
+void probeResidency() {
+	if (!rdmsrCarefully || (resOk & 0x80000000U)) return;
+	auto rd = reinterpret_cast<int (*)(uint32_t, uint32_t *, uint32_t *)>(rdmsrCarefully);
+	uint32_t lo, hi, ok = 0x80000000U;
+	if (intel == 1) {
+		for (unsigned i = 0; i < 7; i++) if (rd(ResMsr[i], &lo, &hi) == 0) ok |= 1U << i;
+		if (rd(0x3FE, &lo, &hi) == 0) ok |= 1U << 7;
+	}
+	resOk = ok;
+}
+
+// At runtime (sysctl wait=2): the CPU features the wait needs, and the APIC page mapping, which cannot be
+// made in the sleep callback.
+int prepareMwait() {
+	uint32_t a = 1, b, c = 0, d;
+	asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+	const bool hasMwait = (c >> 3) & 1, hasDeadline = (c >> 24) & 1;
+	a = 6; c = 0;
+	asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+	const bool arat = (a >> 2) & 1;   // APIC timer keeps running in deep C-states
+	if (!hasMwait || !hasDeadline || !arat) return ENOTSUP;
+	const uint64_t base = rdmsr(0x1B);
+	if (!(base & 0x800)) return ENXIO;
+	const bool x2 = (base & 0x400) != 0;
+	if (!x2 && !apicMap) {
+		if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(base & 0xFFFFFF000ULL, 0x1000, kIODirectionInOut)) {
+			apicMap = md->map(kIOMapInhibitCache);
+			md->release();
+		}
+		if (!apicMap) return ENOMEM;
+	}
+	apicMmio = x2 ? nullptr : reinterpret_cast<volatile uint32_t *>(apicMap->getVirtualAddress());
+	gS0ixEoi = x2 ? 0 : reinterpret_cast<uint64_t>(apicMmio) + 0xB0;
+	mwaitReady = true;
+	return 0;
+}
+
+// In the sleep callback (interrupts off, other CPUs off). lapic_shutdown has masked the LVTs and may have
+// software- or globally-disabled the APIC: it is enabled in the mode it was prepared in, and leaveMwait
+// restores the exact state.
+bool enterMwait(ApicSave &s) {
+	s.base = rdmsr(0x1B);
+	apicFound = s.base;
+	const bool x2 = apicMmio == nullptr;
+	if (s.base & 0x800) {
+		if (((s.base & 0x400) != 0) != x2) { mwaitFail = 1; return false; }
+	} else {
+		wrmsr(0x1B, (s.base | 0x800) & ~0x400ULL);   // disabled -> xAPIC (-> x2APIC)
+		if (x2) wrmsr(0x1B, s.base | 0xC00);
+	}
+	asm volatile("sidt %0" : "=m"(s.idt));
+	// XNU sets the IDT limit to 0x1000 + the CPU number: the 256 gates are the first 4096 bytes.
+	if ((size_t)s.idt.limit + 1 < sizeof(idtCopy)) {
+		if (rdmsr(0x1B) != s.base) wrmsr(0x1B, s.base);
+		mwaitFail = 2;
+		return false;
+	}
+	s.svr = apicRead(0xF0);
+	s.lvt = apicRead(0x320);
+	s.tpr = apicRead(0x80);
+	s.deadline = rdmsr(0x6E0);
+	memcpy(idtCopy, reinterpret_cast<const void *>(s.idt.base), sizeof(idtCopy));
+	uint16_t cs;
+	asm volatile("mov %%cs, %0" : "=r"(cs));
+	setGate(TimerVector, reinterpret_cast<uint64_t>(&s0ixTimerGate), cs);
+	setGate(SpuriousVector, reinterpret_cast<uint64_t>(&s0ixSpuriousGate), cs);
+	Idtr ours {s.idt.limit, reinterpret_cast<uint64_t>(idtCopy)};
+	asm volatile("lidt %0" : : "m"(ours) : "memory");
+	apicWrite(0xF0, (s.svr & ~0xFFU) | 0x100U | SpuriousVector);   // software enabled
+	apicWrite(0x80, 0xE0);                                          // only vectors >= 0xF0
+	apicWrite(0x320, (2U << 17) | TimerVector);                     // TSC deadline mode, unmasked
+	mwaitFail = 0;
+	return true;
+}
+
+void leaveMwait(const ApicSave &s) {
+	wrmsr(0x6E0, 0);
+	asm volatile("sti\n\tnop\n\tnop\n\tcli" : : : "memory");   // a deadline that fired after the last cli lands here
+	apicWrite(0x320, s.lvt);
+	apicWrite(0x80, s.tpr);
+	apicWrite(0xF0, s.svr);
+	asm volatile("lidt %0" : : "m"(s.idt) : "memory");
+	if (s.deadline) wrmsr(0x6E0, s.deadline);
+	if (rdmsr(0x1B) != s.base) wrmsr(0x1B, s.base);
 }
 
 // ─── the wait ───────────────────────────────────────────────────────────────────────────────────
@@ -259,6 +425,14 @@ void s0ixWait(void *) {
 		}
 	}
 	lastHwp = hwpSet ? hwp : 0;
+	const uint32_t rok = resOk;
+	uint64_t r0[7] = {};
+	for (unsigned i = 0; i < 7; i++) if (rok & (1U << i)) r0[i] = rdmsr(ResMsr[i]);
+	ApicSave as {};
+	const bool mw = wait == 2 && mwaitReady && tpms && enterMwait(as);
+	const uint64_t mwPeriod = tpms * (uint64_t)periodMs;
+	const uint32_t irq0 = gS0ixTimerIrqs;
+	const uint64_t c70 = mw && (rok & (1U << 7)) ? rdmsr(0x3FE) : 0;
 	while (!reason) {
 		const uint16_t pm1 = inw(pm1Sts);
 		if (pm1 & Pm1PwrBtn) reason = 1;
@@ -282,10 +456,25 @@ void s0ixWait(void *) {
 			}
 			snap[i] = g;
 		}
-		if (wait >= 1 && waitPkg == 1 && tpms) tpause(rdtsc() + tpms);   // ~1 ms
+		if (mw) {
+			if (reason) break;
+			wrmsr(0x6E0, rdtsc() + mwPeriod);
+			asm volatile(".byte 0x0f, 0x01, 0xc8" : : "a"(monitorLine), "c"(0U), "d"(0U) : "memory");   // MONITOR
+			asm volatile("sti\n\t.byte 0x0f, 0x01, 0xc9\n\tcli" : : "a"(0x60U), "c"(1U) : "memory");   // MWAIT C10
+		} else if (wait >= 1 && waitPkg == 1 && tpms) tpause(rdtsc() + tpms);   // ~1 ms
 		else spin(2000);
 		++loops;
 		if (!reason && safety && rdtsc() - t0 >= safety) reason = 3;
+	}
+	if (mw) {
+		mwaitIrqs = gS0ixTimerIrqs - irq0;
+		coreC7Ms = (rok & (1U << 7)) ? (rdmsr(0x3FE) - c70) / tpms : 0;
+		leaveMwait(as);
+	} else mwaitIrqs = 0;
+	lastMwait = mw ? 1 : (wait == 2 ? 2 : 0);
+	{
+		const uint64_t dt = rdtsc() - t0;
+		for (unsigned i = 0; i < 7; i++) resPm[i] = (rok & (1U << i)) && dt ? (uint32_t)((rdmsr(ResMsr[i]) - r0[i]) * 1000ULL / dt) : 0;
 	}
 	if (hwpSet) wrmsr(MsrHwpRequest, hwp);
 	{
@@ -357,7 +546,19 @@ int enableHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) 
 	return 0;
 }
 
-int waitHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &waitMode, 0, 1, r); }
+int waitHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = waitMode;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value < 0 || value > 2) return EINVAL;
+	if (value == 2) {
+		if (!prepare()) return ENXIO;
+		if (const int e = prepareMwait()) return e;
+	}
+	waitMode = value;
+	return 0;
+}
+int periodHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &periodMs, 5, 1000, r); }
 int safetyHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &safetySec, 0, 86400, r); }
 int gtHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
 	const int error = intHandler(o, &gtReset, 0, 1, r);
@@ -404,7 +605,7 @@ int listHandler(struct sysctl_oid *oidp, void *, int arg2, struct sysctl_req *re
 	return parseList(buf, map, text, sizeof(ecIgnoreText)) ? 0 : EINVAL;
 }
 
-char statText[480];
+char statText[760];
 int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	char en[2 * MaxGpeBytes + 1];
 	size_t u = 0;
@@ -413,10 +614,14 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	snprintf(statText, sizeof(statText),
 		"route=%d enable=%d platform=%d lps0=%d pm1=0x%x gpe0=0x%x/%u ec=0x%x/0x%x ecgpe=%d kbc=%d intel=%d hwp_cap=%d waitpkg=%d tsc_ms=%llu"
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
-		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x",
+		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x"
+		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
+		" pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
-		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult);
+		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult,
+		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
+		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk);
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -424,7 +629,8 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 
 SYSCTL_NODE(_debug, OID_AUTO, s0ix, CTLFLAG_RW, 0, "S0ixSleep");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, enable, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, enableHandler, "I", "1 = sleep in s0ix instead of S3");
-SYSCTL_PROC(_debug_s0ix, OID_AUTO, wait, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, waitHandler, "I", "0 spin, 1 low power");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, wait, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, waitHandler, "I", "0 spin, 1 TPAUSE, 2 MWAIT + APIC timer");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, period, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, periodHandler, "I", "wait 2: APIC timer period (ms)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, safetyHandler, "I", "wake after N s (0 never)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, gtreset, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, gtHandler, "I", "1 = reset the Intel GT on wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_ignore, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, listHandler, "A", "EC events that do not wake (hex)");
@@ -450,6 +656,8 @@ void S0ix::install(KernelPatcher &patcher) {
 		requestUserActive = patcher.solveSymbol(KernelPatcher::KernelID, "__ZN14IOPMrootDomain17requestUserActiveEP9IOServicePKc");
 		patcher.clearError();
 		userWakeCall = requestUserActive ? thread_call_allocate(userWakeWork, nullptr) : nullptr;
+		rdmsrCarefully = patcher.solveSymbol(KernelPatcher::KernelID, "_rdmsr_carefully");
+		patcher.clearError();
 		registerPrioritySleepWakeInterest(sleepInterest, nullptr, nullptr);
 		const uint64_t ptr = reinterpret_cast<uint64_t>(&shared);
 		if (OSData *d = OSData::withBytes(&ptr, sizeof(ptr))) {
@@ -460,6 +668,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix);
 	sysctl_register_oid(&sysctl__debug_s0ix_enable);
 	sysctl_register_oid(&sysctl__debug_s0ix_wait);
+	sysctl_register_oid(&sysctl__debug_s0ix_period);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_gtreset);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_ignore);

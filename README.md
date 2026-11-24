@@ -19,15 +19,20 @@ the other CPU cores are turned off and the firmware's `_PTS` runs. Only the very
 `acpi_sleep_kernel` ends with a callback that writes `SLP_TYP`/`SLP_EN` to enter S3; S0ixSleep replaces
 that callback. Instead of entering S3, the last CPU core:
 
-1. lowers its HWP performance request to the minimum and waits in `TPAUSE` (C0.2) when the CPU supports it;
-2. polls the ACPI event registers about once per millisecond (power button, RTC alarm, and every general
-   purpose event the OS armed for wake: lid, embedded controller, ...);
-3. on a wake event, restores the CPU state and returns. XNU then runs its normal resume path, exactly as
+1. lowers its HWP performance request to the minimum;
+2. sleeps in `MWAIT` C10 and wakes every 50 ms on its local APIC timer;
+3. each time, checks the ACPI event registers (power button, RTC alarm, and every general purpose event
+   the OS armed for wake: lid, embedded controller, ...);
+4. on a wake event, puts the CPU state back and returns. XNU then runs its normal resume path, exactly as
    after a sleep attempt that failed, and macOS wakes up.
 
-Interrupts cannot end the wait (XNU has already shut the core's local APIC down), which is why the event
-registers are polled. Their I/O ports come from the FADT; the embedded controller's ports come from the
-ECDT (default `0x62`/`0x66`).
+XNU has already shut the core's local APIC down at that point, so no interrupt would end a deep `MWAIT`.
+S0ixSleep enables the APIC for the wait, points its timer (TSC deadline mode) at a vector of a copy of the
+kernel's IDT whose gate only acknowledges it, and raises the task priority so that no kernel interrupt can
+be delivered; afterwards everything is put back exactly as it was. With the waiting core in C7 the
+package can leave its active state. (Fallback `wait 1`: `TPAUSE` C0.2, simpler but the package stays in
+PC0.) The I/O ports of the event registers come from the FADT; the embedded controller's ports come from
+the ECDT (default `0x62`/`0x66`).
 
 After a wake caused by the user (key, lid, power button), S0ixSleep asks the power manager for a full wake
 (`IOPMrootDomain::requestUserActive`), otherwise macOS would stay in a dark wake with the display off.
@@ -42,7 +47,7 @@ and moving around, not for leaving a laptop asleep in a bag for days.
 | | |
 |---|---|
 | Wake | lid open, any key, power button; display back in about 2 s |
-| CPU package power while asleep (RAPL) | about 2.9 W |
+| CPU package power while asleep (RAPL) | about 1.85 W (`wait 2`, package in PC3 98% of the time); 2.9 W with `wait 1` |
 | Fans, power LED | off (with the SSDT that tells the EC about Modern Standby) |
 | Time to fall asleep | about 17 s, mostly powerd's own dark wake delay |
 
@@ -91,6 +96,7 @@ sysctl debug.s0ix.stat
 | `platform` | 1 = FADT read. `pm1`, `gpe0` (port/bytes), `ec` (command/data ports), `ecgpe`: what it found |
 | `sleeps`, `reason` | completed sleeps and last wake reason: 1 power button, 2 RTC, 3 safety timer, `0x100` + GPE number |
 | `ms`, `pkg_mw`, `core_mw` | length of the last sleep, average package and core power during it |
+| `mwait`, `timer_irqs`, `core_c7_ms`, `mwait_fail` | 1 = last sleep used `wait 2`; timer wakes; core C7 time; why `wait 2` was not entered (1 APIC mode changed, 2 IDT) |
 | `ec_q`, `ec_ign` | last embedded controller events read during sleep (newest first), events ignored |
 | `userwake` | full wakes requested after a user wake |
 
@@ -112,7 +118,16 @@ the next event after wake. The kext reads the event only when no keyboard byte i
 key presses always wake.
 
 The settings are also sysctls (`debug.s0ix.ec_ignore`, `debug.s0ix.ec_wake`, `debug.s0ix.safety`,
-`debug.s0ix.wait`, `debug.s0ix.gtreset`) and boot arguments (`s0ixecign=51,52`, `s0ixecwake=5e,5f`).
+`debug.s0ix.wait`, `debug.s0ix.period`, `debug.s0ix.gtreset`) and boot arguments (`s0ixecign=51,52`,
+`s0ixecwake=5e,5f`).
+
+### Package idle states
+
+`pc=` in the status is the share of the last sleep (per mille) the package spent in PC2, PC3, PC6, PC7,
+PC8, PC9 and PC10; `core_c7_ms` is the time the waiting core spent in C7. If the package stops at PC2/PC3,
+something outside the CPU cores keeps it awake. On the tested machine it is the display engine: its pipe
+and eDP link stay on during sleep, because the graphics driver cannot use panel self refresh or the
+display's DC5/DC6 states.
 
 ### Graphics
 

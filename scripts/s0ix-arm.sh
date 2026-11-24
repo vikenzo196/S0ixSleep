@@ -25,9 +25,13 @@ if ! sysctl -n debug.s0ix.stat 2>/dev/null | grep -q "^route=1 "; then
 fi
 
 # Configuration: KEY=value lines, see s0ixsleep.conf.
-WAIT=1; SAFETY=0; GT_RESET=0; EC_IGNORE=; EC_WAKE=
+WAIT=2; PERIOD=50; SAFETY=0; GT_RESET=0; EC_IGNORE=; EC_WAKE=
 [ -f "$CONF" ] && . "$CONF"
-sysctl -w debug.s0ix.wait="$WAIT" >/dev/null
+sysctl -w debug.s0ix.period="$PERIOD" >/dev/null
+if ! sysctl -w debug.s0ix.wait="$WAIT" >/dev/null 2>&1; then
+  log "wait $WAIT refused (CPU or APIC not suitable), using wait 1"
+  sysctl -w debug.s0ix.wait=1 >/dev/null
+fi
 sysctl -w debug.s0ix.safety="$SAFETY" >/dev/null
 sysctl -w debug.s0ix.gtreset="$GT_RESET" >/dev/null
 [ -n "$EC_IGNORE" ] && sysctl -w debug.s0ix.ec_ignore="$EC_IGNORE" >/dev/null
@@ -38,7 +42,7 @@ pmset -a hibernatemode 0 standby 0 autopoweroff 0 >/dev/null 2>&1
 
 if sysctl -w debug.s0ix.enable=1 >/dev/null 2>&1 && [ "$(sysctl -n debug.s0ix.enable)" = 1 ]; then
   pmset -a disablesleep 0
-  log "enabled, sleep allowed: $(sysctl -n debug.s0ix.stat | cut -d' ' -f1-12)"
+  log "enabled (wait $(sysctl -n debug.s0ix.wait)), sleep allowed: $(sysctl -n debug.s0ix.stat | cut -d' ' -f1-12)"
 else
   log "enable failed (no FADT event blocks?): sleep stays disabled: $(sysctl -n debug.s0ix.stat 2>/dev/null | cut -d' ' -f1-8)"
   idle
