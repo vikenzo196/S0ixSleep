@@ -1,0 +1,152 @@
+# S0ixSleep
+
+Sleep for Hackintosh laptops whose firmware has no S3.
+
+Most laptops released since about 2020 only support Modern Standby (S0ix): the firmware no longer
+implements S3 (suspend to RAM). macOS only knows S3, so on these machines closing the lid or choosing
+Sleep resets the laptop, hangs it with a black screen, or never wakes. The usual advice is to disable
+sleep altogether (`pmset disablesleep 1`).
+
+S0ixSleep is a [Lilu](https://github.com/acidanthera/Lilu) plugin that lets macOS sleep anyway.
+
+> **Experimental.** Tested on one machine so far (Samsung Galaxy Book3 Ultra, i9-13900H, macOS Tahoe 26.7).
+> Reports from other laptops are very welcome.
+
+## How it works
+
+macOS keeps its whole sleep path: apps and drivers are told about sleep and power their devices down,
+the other CPU cores are turned off and the firmware's `_PTS` runs. Only the very last step changes.
+`acpi_sleep_kernel` ends with a callback that writes `SLP_TYP`/`SLP_EN` to enter S3; S0ixSleep replaces
+that callback. Instead of entering S3, the last CPU core:
+
+1. lowers its HWP performance request to the minimum and waits in `TPAUSE` (C0.2) when the CPU supports it;
+2. polls the ACPI event registers about once per millisecond (power button, RTC alarm, and every general
+   purpose event the OS armed for wake: lid, embedded controller, ...);
+3. on a wake event, restores the CPU state and returns. XNU then runs its normal resume path, exactly as
+   after a sleep attempt that failed, and macOS wakes up.
+
+Interrupts cannot end the wait (XNU has already shut the core's local APIC down), which is why the event
+registers are polled. Their I/O ports come from the FADT; the embedded controller's ports come from the
+ECDT (default `0x62`/`0x66`).
+
+After a wake caused by the user (key, lid, power button), S0ixSleep asks the power manager for a full wake
+(`IOPMrootDomain::requestUserActive`), otherwise macOS would stay in a dark wake with the display off.
+
+**This is not real S0ix.** macOS has no driver for the Intel PMC, so the package does not reach the deep
+S0ix states that Windows uses. Devices are powered down by their macOS drivers and the CPU waits at its
+lowest level, but the machine draws more than in Windows Modern Standby. It is meant for closing the lid
+and moving around, not for leaving a laptop asleep in a bag for days.
+
+## Results (Galaxy Book3 Ultra)
+
+| | |
+|---|---|
+| Wake | lid open, any key, power button; display back in about 2 s |
+| CPU package power while asleep (RAPL) | about 2.9 W |
+| Fans, power LED | off (with the SSDT that tells the EC about Modern Standby) |
+| Time to fall asleep | about 17 s, mostly powerd's own dark wake delay |
+
+## Requirements
+
+- OpenCore, [Lilu](https://github.com/acidanthera/Lilu) 1.6.0 or newer.
+- Intel CPU. HWP and the RAPL power reading need an Intel CPU; the wait itself is plain ACPI.
+- macOS 13 to 26. S0ixSleep checks the code of `acpi_sleep_kernel` before it hooks it; if the check
+  fails (`route=3` in the status), nothing is changed and sleep stays disabled.
+- An ACPI setup where macOS can already reach sleep: if your machine resets when it sleeps, that is the
+  right starting point.
+- A graphics driver that survives a wake where the GPU **kept** its power (after S3 it would have lost
+  it). This is the main unknown on other machines; see [Graphics](#graphics).
+
+## Installation
+
+1. Add `S0ixSleep.kext` to `EFI/OC/Kexts` and to `config.plist` → Kernel → Add, **after Lilu**.
+2. Optional but recommended: the ACPI part, see [docs/ACPI.md](docs/ACPI.md).
+3. Reboot, then install the daemon:
+
+   ```
+   cd S0ixSleep-x.y.z/scripts
+   sudo ./install.sh
+   ```
+
+   The daemon `io.github.vikenzo196.s0ixsleep` disables sleep at boot, configures and enables the kext from
+   `/usr/local/etc/s0ixsleep.conf`, and **only then** allows sleep. If the kext is missing or cannot be
+   enabled, sleep stays disabled, so the machine never falls back to the firmware's broken S3.
+   It also sets `hibernatemode 0`, `standby 0` and `autopoweroff 0`.
+
+4. First test, with a 60 s safety timer: set `SAFETY=60` in `/usr/local/etc/s0ixsleep.conf`, run
+   `sudo launchctl kickstart -k system/io.github.vikenzo196.s0ixsleep`, then `pmset sleepnow`.
+   The laptop should wake by itself after a minute, or earlier when you press a key.
+
+Kill switch: `sudo touch /usr/local/etc/s0ixsleep-off` and reboot. Uninstall: `sudo ./uninstall.sh`.
+
+## Status and tuning
+
+```
+sysctl debug.s0ix.stat
+```
+
+| Field | Meaning |
+|---|---|
+| `route` | 1 = hooked. 2 = symbol not found, 3 = unexpected code (macOS version not supported) |
+| `platform` | 1 = FADT read. `pm1`, `gpe0` (port/bytes), `ec` (command/data ports), `ecgpe`: what it found |
+| `sleeps`, `reason` | completed sleeps and last wake reason: 1 power button, 2 RTC, 3 safety timer, `0x100` + GPE number |
+| `ms`, `pkg_mw`, `core_mw` | length of the last sleep, average package and core power during it |
+| `ec_q`, `ec_ign` | last embedded controller events read during sleep (newest first), events ignored |
+| `userwake` | full wakes requested after a user wake |
+
+### Spurious wakes: embedded controller events
+
+The embedded controller raises one GPE for all its events: battery level, AC adapter, temperature, fans,
+as well as the lid and the keyboard. By default every EC event wakes the laptop. If it wakes up by itself,
+`reason` is `0x100` + the EC's GPE and `ec_q` shows the event number (the `_Qxx` method in your DSDT).
+Look the methods up in your DSDT and list the ones that should not wake in `s0ixsleep.conf`:
+
+```
+EC_IGNORE=51,52,53,54     # these events do not wake
+# or
+EC_WAKE=50,5e,5f          # only these events wake
+```
+
+A filtered event is consumed: its `_Qxx` method does not run, so macOS sees a battery or AC change only at
+the next event after wake. The kext reads the event only when no keyboard byte is waiting in the 8042, so
+key presses always wake.
+
+The settings are also sysctls (`debug.s0ix.ec_ignore`, `debug.s0ix.ec_wake`, `debug.s0ix.safety`,
+`debug.s0ix.wait`, `debug.s0ix.gtreset`) and boot arguments (`s0ixecign=51,52`, `s0ixecwake=5e,5f`).
+
+### Graphics
+
+After this kind of sleep the GPU kept its power and its state, while macOS graphics drivers expect the
+cold GPU of an S3 resume. On the tested machine (Iris Xe with a patched framebuffer) the graphics kext
+needed changes to wake cleanly. Things to try if the display does not come back:
+
+- `GT_RESET=1` (Intel Gen12, Tiger Lake and newer): resets the render engine before returning, like a
+  power cycle would.
+- Graphics kexts can detect S0ixSleep: it publishes the `S0ixSleep` resource with a pointer to a small
+  shared structure (sleep counter, "sleeping" flag), see `S0ixSleep/kern_s0ix.hpp`.
+
+## Building
+
+```
+git clone https://github.com/acidanthera/MacKernelSDK
+# Lilu headers: Lilu.kext from a Lilu DEBUG or RELEASE zip, in the repository root
+python3 tools/build.py --release --output build/RELEASE
+```
+
+## Boot arguments
+
+| | |
+|---|---|
+| `-s0ixoff` | do not load |
+| `-s0ixdbg` | debug log (DEBUG build) |
+| `s0ixecign=`, `s0ixecwake=` | EC event lists at boot |
+
+## Credits
+
+- [Lilu](https://github.com/acidanthera/Lilu) and [MacKernelSDK](https://github.com/acidanthera/MacKernelSDK) by acidanthera.
+- The Linux kernel's s2idle and LPS0 code (`drivers/acpi/x86/s2idle.c`) and i915 documentation, for how
+  Modern Standby firmware expects to be driven.
+
+## License
+
+BSD 3-Clause, see [LICENSE](LICENSE).

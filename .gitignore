@@ -1,0 +1,5 @@
+build/
+MacKernelSDK/
+Lilu.kext/
+*.aml
+.DS_Store

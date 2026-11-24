@@ -1,0 +1,73 @@
+/*
+ * macOS s2idle-style sleep on the Galaxy Book3 Ultra (no working S3).
+ *
+ * Sleep (_PTS -> \_SB.PTS -> QPTS): the firmware's QPTS sends the EC mailbox
+ * command 0x9F/0xA1 ("sleep is coming"): the EC then blinks the power LED and
+ * stops the keyboard until SLP_S3#/PLTRST# reset it, which a sleep without S3
+ * never produces, and _WAK has no command to undo it. On macOS, for S3 only,
+ * skip it and instead tell the EC what Windows Modern Standby tells it through
+ * the PEPD _DSM (this firmware only supports S0ix):
+ *   Intel  c4eb40a0 fn3 (display off)  -> H_EC.CSMF = 1
+ *   MS     11e00d56 fn7 (sleep entry)  -> H_EC.MSST = 1
+ *   Intel  c4eb40a0 fn5 (LPS0 entry)   -> H_EC.CSMF = 3
+ * Wake (_WAK -> \_SB.WAK -> QWAK), reverse order:
+ *   Intel fn6 (LPS0 exit) CSMF = 1, MS fn8 (sleep exit) MSST = 0,
+ *   Intel fn4 (display on) CSMF = 0, then the firmware's QWAK.
+ * Only the EC flags are replayed, not the rest of those _DSM functions (GUAM,
+ * dGPU, XHCI, GPIO hooks, display-off wait loop).
+ *
+ * Requires in DSDT.aml the method definitions \_SB.QPTS -> \_SB.XPTS
+ * (14 40 07 "QPTS" 01 -> 14 40 07 "XPTS" 01) and \_SB.QWAK -> \_SB.XWAK
+ * (14 43 1B "QWAK" 01 -> 14 43 1B "XWAK" 01). S4/S5 keep the original path.
+ */
+DefinitionBlock ("", "SSDT", 2, "VIK", "S2QPTS", 0x00002000)
+{
+    External (_SB_.XPTS, MethodObj)
+    External (_SB_.XWAK, MethodObj)
+    External (_SB_.PC00.LPCB.H_EC.CSMF, FieldUnitObj)
+    External (_SB_.PC00.LPCB.H_EC.MSST, FieldUnitObj)
+    External (ECON, FieldUnitObj)
+
+    Scope (_SB)
+    {
+        Method (QPTS, 1, NotSerialized)
+        {
+            If (_OSI ("Darwin"))
+            {
+                If ((Arg0 == 0x03))
+                {
+                    If (ECON)
+                    {
+                        \_SB.PC00.LPCB.H_EC.CSMF = One
+                        \_SB.PC00.LPCB.H_EC.MSST = One
+                        \_SB.PC00.LPCB.H_EC.CSMF = 0x03
+                    }
+
+                    Return (Zero)
+                }
+            }
+
+            XPTS (Arg0)
+            Return (Zero)
+        }
+
+        Method (QWAK, 1, NotSerialized)
+        {
+            If (_OSI ("Darwin"))
+            {
+                If ((Arg0 == 0x03))
+                {
+                    If (ECON)
+                    {
+                        \_SB.PC00.LPCB.H_EC.CSMF = One
+                        \_SB.PC00.LPCB.H_EC.MSST = Zero
+                        \_SB.PC00.LPCB.H_EC.CSMF = Zero
+                    }
+                }
+            }
+
+            XWAK (Arg0)
+            Return (Zero)
+        }
+    }
+}
