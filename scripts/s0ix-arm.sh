@@ -14,7 +14,7 @@
 #    BAG_GUARD seconds, back to sleep (a wake nobody asked for must not keep the laptop running in a bag);
 #  - network off while asleep: the interfaces in SLEEP_IF_DOWN go down while the lid is closed and no display
 #    is on (so not in clamshell mode with an external monitor), and come back when the lid opens or a display
-#    turns on. Wi-Fi drivers that keep the card active through sleep (itlwm) cost about 1 W.
+#    turns on. Off by default: on the tested machine (itlwm) it made no measurable difference.
 # Kill switch: create /usr/local/etc/s0ixsleep-off and reboot (sleep stays disabled).
 export PATH=/usr/sbin:/usr/bin:/bin:/sbin
 CONF=/usr/local/etc/s0ixsleep.conf
