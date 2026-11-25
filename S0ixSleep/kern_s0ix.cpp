@@ -32,8 +32,10 @@
 //  thermal, fans, as well as the lid and the key that should wake us. When it rises with no keyboard
 //  byte waiting in the 8042, the EC event is read (ACPI EC QR_EC 0x84). With an ignore list
 //  (debug.s0ix.ec_ignore) those events are consumed and the wait goes on; with a wake list
-//  (debug.s0ix.ec_wake) only those events wake. With neither, every EC event wakes. A consumed event's
-//  _Qxx method never runs, so the OS may see that battery or AC change only at the next event.
+//  (debug.s0ix.ec_wake) only those events wake. With neither, every EC event wakes. The _Qxx method of a
+//  consumed event cannot run in the wait; with debug.s0ix.ec_replay=1 (default) each consumed event's method
+//  is evaluated once after the wake (thread context, 0.5 s after kIOMessageSystemHasPoweredOn), so the OS
+//  sees the battery and AC changes that happened during the sleep at once.
 //
 //  Full wake. After a wake caused by the user (power button, a GPE that is not the RTC or the safety
 //  timer), the system would come back as a dark wake, because XNU does not recognise the wake reason as
@@ -126,6 +128,7 @@ int waitMode = 1;       // 2 = MWAIT + LAPIC timer, 1 = TPAUSE, 0 = PAUSE spin (
 int periodMs = 50;      // wait 2: LAPIC timer period
 int safetySec = 0;      // wake by itself after N seconds (0 = never)
 int gtReset = 0;        // 1 = reset the Intel GT before returning (Gen12+, see README)
+int ecReplay = 1;       // 1 = run the _Qxx methods of the EC events consumed during the sleep after wake
 uint32_t ecIgnore[8], ecWake[8];
 char ecIgnoreText[200], ecWakeText[200];
 
@@ -149,6 +152,12 @@ uint32_t lastMwait = 0;   // 1 = last wait used MWAIT, 2 = asked for but not ent
 uint8_t gpeEn[MaxGpeBytes];
 volatile bool userWakePending = false;
 thread_call_t userWakeCall = nullptr;
+// EC events consumed during the wait, replayed after wake.
+IOACPIPlatformDevice *ecDevice = nullptr;
+uint32_t replayMap[8];
+volatile bool replayPending = false;
+thread_call_t replayCall = nullptr;
+uint32_t replayedLast = 0, replayedTotal = 0;
 S0ixSleepShared shared {S0ixSleepSharedVersion, 0, 0, 0, 0};
 
 bool mapHas(const uint32_t *m, uint32_t q) { return q < 256 && (m[q >> 5] >> (q & 31)) & 1; }
@@ -213,7 +222,11 @@ bool readPlatform() {
 		while (auto *o = it->getNextObject()) {
 			auto *dev = o->metaCast("IOACPIPlatformDevice") ? static_cast<IOACPIPlatformDevice *>(o) : nullptr;
 			UInt32 g = 0;
-			if (dev && dev->evaluateInteger("_GPE", &g) == kIOReturnSuccess && g < MaxGpeBytes * 8) { ecGpe = (int)g; break; }
+			if (dev && dev->evaluateInteger("_GPE", &g) == kIOReturnSuccess && g < MaxGpeBytes * 8) {
+				ecGpe = (int)g;
+				if (!ecDevice) { ecDevice = dev; dev->retain(); }
+				break;
+			}
 		}
 		it->release();
 	}
@@ -446,6 +459,7 @@ void s0ixWait(void *) {
 					ecLast[3] = ecLast[2]; ecLast[2] = ecLast[1]; ecLast[1] = ecLast[0]; ecLast[0] = q;
 					if (ecIgnorable(q)) {
 						ecIgnored++;
+						replayMap[q >> 5] |= 1U << (q & 31);
 						outb(port(gpe0Sts, i), rise);   // clear this GPE only
 						snap[i] = g & (uint8_t)~rise;
 						continue;
@@ -495,6 +509,7 @@ void s0ixWait(void *) {
 	shared.reason = reason;
 	__atomic_add_fetch(&shared.sleeps, 1, __ATOMIC_RELEASE);
 	if (reason != 2 && reason != 3) __atomic_store_n(&userWakePending, true, __ATOMIC_RELEASE);
+	if (mapAny(replayMap)) __atomic_store_n(&replayPending, true, __ATOMIC_RELEASE);
 }
 
 void acpiSleepKernel(AcpiSleepCallback func, void *refcon) {
@@ -511,6 +526,22 @@ void userWakeWork(thread_call_param_t, thread_call_param_t) {
 	}
 }
 
+void replayWork(thread_call_param_t, thread_call_param_t) {
+	uint32_t m[8];
+	for (unsigned i = 0; i < 8; i++) m[i] = __atomic_exchange_n(&replayMap[i], 0U, __ATOMIC_ACQ_REL);
+	uint32_t n = 0;
+	if (ecReplay && ecDevice) {
+		for (unsigned q = 0; q < 256; q++) {
+			if (!((m[q >> 5] >> (q & 31)) & 1)) continue;
+			char name[8];
+			snprintf(name, sizeof(name), "_Q%02X", q);
+			if (ecDevice->validateObject(name) == kIOReturnSuccess && ecDevice->evaluateObject(name) == kIOReturnSuccess) n++;
+		}
+	}
+	replayedLast = n;
+	replayedTotal += n;
+}
+
 IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size_t) {
 	if ((type == kIOMessageSystemCapabilityChange || type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn) &&
 	    userWakeCall && __atomic_exchange_n(&userWakePending, false, __ATOMIC_ACQ_REL)) {
@@ -518,6 +549,11 @@ IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size
 		uint64_t deadline;
 		clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
 		thread_call_enter_delayed(userWakeCall, deadline);
+	}
+	if (type == kIOMessageSystemHasPoweredOn && replayCall && __atomic_exchange_n(&replayPending, false, __ATOMIC_ACQ_REL)) {
+		uint64_t deadline;
+		clock_interval_to_deadline(500, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(replayCall, deadline);
 	}
 	if (type == kIOMessageSystemWillSleep && enabled == 1 && platformReady) __atomic_store_n(&shared.sleeping, 1U, __ATOMIC_RELEASE);
 	else if (type == kIOMessageSystemHasPoweredOn) __atomic_store_n(&shared.sleeping, 0U, __ATOMIC_RELEASE);
@@ -559,6 +595,7 @@ int waitHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	return 0;
 }
 int periodHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &periodMs, 5, 1000, r); }
+int replayHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &ecReplay, 0, 1, r); }
 int safetyHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &safetySec, 0, 86400, r); }
 int gtHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
 	const int error = intHandler(o, &gtReset, 0, 1, r);
@@ -616,12 +653,12 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		" pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x",
+		" pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
-		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk);
+		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal);
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -631,6 +668,7 @@ SYSCTL_NODE(_debug, OID_AUTO, s0ix, CTLFLAG_RW, 0, "S0ixSleep");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, enable, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, enableHandler, "I", "1 = sleep in s0ix instead of S3");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, wait, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, waitHandler, "I", "0 spin, 1 TPAUSE, 2 MWAIT + APIC timer");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, period, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, periodHandler, "I", "wait 2: APIC timer period (ms)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_replay, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, replayHandler, "I", "1 = run consumed EC events' _Qxx after wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, safetyHandler, "I", "wake after N s (0 never)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, gtreset, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, gtHandler, "I", "1 = reset the Intel GT on wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_ignore, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, listHandler, "A", "EC events that do not wake (hex)");
@@ -656,6 +694,7 @@ void S0ix::install(KernelPatcher &patcher) {
 		requestUserActive = patcher.solveSymbol(KernelPatcher::KernelID, "__ZN14IOPMrootDomain17requestUserActiveEP9IOServicePKc");
 		patcher.clearError();
 		userWakeCall = requestUserActive ? thread_call_allocate(userWakeWork, nullptr) : nullptr;
+		replayCall = thread_call_allocate(replayWork, nullptr);
 		rdmsrCarefully = patcher.solveSymbol(KernelPatcher::KernelID, "_rdmsr_carefully");
 		patcher.clearError();
 		registerPrioritySleepWakeInterest(sleepInterest, nullptr, nullptr);
@@ -669,6 +708,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_enable);
 	sysctl_register_oid(&sysctl__debug_s0ix_wait);
 	sysctl_register_oid(&sysctl__debug_s0ix_period);
+	sysctl_register_oid(&sysctl__debug_s0ix_ec_replay);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_gtreset);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_ignore);
