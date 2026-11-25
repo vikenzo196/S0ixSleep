@@ -213,7 +213,7 @@ ask() {
 	local a
 	if [ "$YES" = 1 ]; then printf '%s [y/N] y\n' "$1"; return 0; fi
 	printf '%s [y/N] ' "$1"
-	read -r a </dev/tty || return 1
+	{ read -r a </dev/tty; } 2>/dev/null || return 1
 	case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
@@ -463,12 +463,154 @@ cmd_uninstall() {
 	more "Reboot to unload the kext. Sleep stays disabled."
 }
 
+# ---------------------------------------------------------------------------------------------------------
+# test / report
+
+conf_get() { [ -f "$CONF" ] && sed -n "s/^$1=//p" "$CONF" | tail -1; }
+
+# conf_set KEY VALUE: changes (or adds) KEY=VALUE in s0ixsleep.conf, keeping a dated copy
+conf_set() {
+	cp "$CONF" "$CONF.bak-$(date +%Y%m%d-%H%M%S)" || return 1
+	if grep -q "^$1=" "$CONF"; then
+		sed -i '' "s/^$1=.*/$1=$2/" "$CONF"
+	else
+		printf '%s=%s\n' "$1" "$2" >> "$CONF"
+	fi
+}
+
+TEST_SAFETY=; TEST_HOLD=0
+test_restore() {
+	[ -n "$TEST_SAFETY" ] && sysctl -w debug.s0ix.safety="$TEST_SAFETY" >/dev/null 2>&1
+	[ "$TEST_HOLD" = 1 ] && rm -f /var/run/s0ixsleep-keepawake
+	TEST_SAFETY=; TEST_HOLD=0
+}
+
+describe_reason() { # describe_reason REASON ECGPE
+	local r=$(($1)) e=$(($2))
+	case $r in
+		1) echo "the power button" ;;
+		2) echo "an RTC alarm (a wake macOS scheduled, for example for maintenance)" ;;
+		3) echo "the 60 s safety timer: nothing else woke it" ;;
+		*) if [ $r -ge 256 ] && [ $((r - 256)) -eq "$e" ]; then echo "an embedded controller event"
+		   elif [ $r -ge 256 ]; then printf 'general purpose event 0x%x (lid, keyboard, USB or another device the OS armed)\n' $((r - 256))
+		   else echo "unknown ($1)"; fi ;;
+	esac
+}
+
+cmd_test() {
+	local s0ix route enable sd before after t0 reason ecgpe q ms pkg mw ign
+	[ "$(id -u)" = 0 ] || die "run it with sudo:  sudo $0 test"
+	printf '%sS0ixSleep test%s: one sleep with a 60 s safety timer.\n' "$B" "$N"
+	KEXTS=$(kmutil showloaded --list-only 2>/dev/null)
+	s0ix=$(kext_version "$KEXT_ID")
+	[ -n "$s0ix" ] || die "S0ixSleep is not loaded: install it ($0 install) and reboot first"
+	STAT=$(sysctl -n debug.s0ix.stat 2>/dev/null)
+	route=$(stat_field route); enable=$(stat_field enable)
+	[ "$route" = 1 ] || die "S0ixSleep is not hooked (route=$route): see $0 check"
+	[ "$enable" = 1 ] || die "S0ixSleep is not enabled by the daemon: see $0 check"
+	sd=$(pmset -g | awk '$1 == "SleepDisabled" { print $2 }')
+	[ "$sd" = 0 ] || die "sleep is disabled (SleepDisabled=$sd): see $0 check"
+
+	more "The laptop goes to sleep and wakes by itself after 60 s; this script then turns the display on."
+	more "Leave it alone to see whether something else wakes it, or wake it earlier with a key or the lid."
+	more "Save your work first. Do not close this window."
+	echo
+	ask "Start?" || die "nothing changed"
+
+	TEST_SAFETY=$(sysctl -n debug.s0ix.safety 2>/dev/null)
+	trap 'test_restore; cleanup' EXIT
+	if [ ! -e /var/run/s0ixsleep-keepawake ]; then touch /var/run/s0ixsleep-keepawake; TEST_HOLD=1; fi
+	sysctl -w debug.s0ix.safety=60 >/dev/null || die "could not set the safety timer"
+	before=$(stat_field sleeps)
+	t0=$(date +%s)
+	printf '  going to sleep (macOS takes 10-30 s to get there)...\n'
+	pmset sleepnow >/dev/null
+	while :; do
+		sleep 1
+		STAT=$(sysctl -n debug.s0ix.stat 2>/dev/null); after=$(stat_field sleeps)
+		[ "${after:-0}" -gt "${before:-0}" ] && break
+		if [ $(($(date +%s) - t0)) -gt 120 ]; then
+			test_restore
+			warn "macOS did not go to sleep within 2 minutes. What kept it awake:"
+			pmset -g assertions | grep -E "PreventSystemSleep|PreventUserIdleSystemSleep|NoIdleSleep" | sed 's/^/         /' | head -8
+			die "test not done"
+		fi
+	done
+	caffeinate -u -t 3 >/dev/null 2>&1 &
+	sleep 2
+	test_restore
+	STAT=$(sysctl -n debug.s0ix.stat 2>/dev/null)
+	reason=$(stat_field reason); ecgpe=$(stat_field ecgpe); ms=$(stat_field ms); pkg=$(stat_field pkg_mw)
+	mw=$(stat_field mwait); q=$(stat_field ec_q | cut -d, -f1)
+
+	step "Result"
+	ok "slept for $((${ms:-0} / 1000)) s and woke up"
+	info "woken by $(describe_reason "${reason:-0}" "${ecgpe:-0}")"
+	[ -n "$pkg" ] && [ "$pkg" -gt 0 ] && info "CPU package power while asleep: $(awk -v m="$pkg" 'BEGIN { printf "%.2f W", m / 1000 }')"
+	[ "$mw" = 1 ] && ok "low-power wait (MWAIT C10) used" || info "low-power wait not used (mwait=${mw:-?}, mwait_fail=$(stat_field mwait_fail))"
+
+	if [ $((reason)) -ge 256 ] && [ $((reason - 256)) -eq $((ecgpe)) ] && [ "$q" != 1ff ]; then
+		echo
+		more "The embedded controller woke it with event $q (method _Q$(echo "$q" | tr a-f A-F) in your DSDT)."
+		if ask "Did you open the lid, press a key or touch the laptop just before it woke?"; then
+			more "Then event $q may be the lid or the keyboard: keep it as a wake event."
+		else
+			more "Nobody asked for this wake: battery, AC and temperature events do this. Ignoring event $q"
+			more "means it no longer wakes the laptop (it still runs after the next wake, with EC_REPLAY=1)."
+			if [ -n "$(conf_get EC_WAKE)" ]; then
+				info "your s0ixsleep.conf uses EC_WAKE (only listed events wake): edit it by hand"
+			elif ask "Add $q to EC_IGNORE in $CONF?"; then
+				ign=$(conf_get EC_IGNORE)
+				ign=$(printf '%s\n' "$ign" | tr ',' '\n' | grep -v "^$" | { cat; echo "$q"; } | sort -u | paste -sd, -)
+				conf_set EC_IGNORE "$ign" || die "could not change $CONF"
+				sysctl -w debug.s0ix.ec_ignore="$ign" >/dev/null 2>&1
+				ok "EC_IGNORE=$ign (saved and active now)"
+				more "Run the test again: other events may show up one at a time."
+			fi
+		fi
+	elif [ $((reason)) -eq 3 ]; then
+		echo
+		more "Now try the lid: close it, wait 15 s, open it. The laptop should wake in a few seconds."
+	fi
+	echo
+	more "If the display came back wrong or black, see $REPO#graphics"
+	more "Status line (for a report):"
+	more "$(sysctl -n debug.s0ix.stat 2>/dev/null)"
+}
+
+cmd_report() {
+	local out serial uuid user f
+	user=${SUDO_USER:-$(id -un)}
+	out="$(user_home)/Desktop/S0ixSleep-report-$(date +%Y%m%d-%H%M%S).txt"
+	serial=$(ioreg -c IOPlatformExpertDevice -d 2 | sed -n 's/.*"IOPlatformSerialNumber" = "\(.*\)"/\1/p' | head -1)
+	uuid=$(ioreg -c IOPlatformExpertDevice -d 2 | sed -n 's/.*"IOPlatformUUID" = "\(.*\)"/\1/p' | head -1)
+	{
+		echo "S0ixSleep report, $(date)"
+		echo; echo "== check"; cmd_check 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+		echo; echo "== debug.s0ix"; sysctl debug.s0ix 2>&1
+		echo; echo "== kexts"; kmutil showloaded --list-only 2>/dev/null | awk '$6 !~ /^com\.apple\./ { print $6, $7 }'
+		echo; echo "== boot-args"; nvram boot-args 2>&1
+		echo; echo "== pmset -g"; pmset -g 2>&1
+		echo; echo "== s0ixsleep.conf"; grep -v '^#' "$CONF" 2>/dev/null | grep -v '^$'
+		echo; echo "== s0ixsleep.log (last 60 lines)"; tail -60 /var/log/s0ixsleep.log 2>/dev/null
+		echo; echo "== sleep and wake (pmset -g log, last 40)"; pmset -g log 2>/dev/null | grep -E " (Sleep|Wake|DarkWake) " | tail -40
+		echo; echo "== kernel messages"; dmesg 2>/dev/null | grep -iE "s0ix|lilu" | tail -40
+	} | sed -e "s#/Users/$user#~#g" | { if [ -n "$serial" ]; then sed "s/$serial/<serial>/g"; else cat; fi; } |
+		{ if [ -n "$uuid" ]; then sed "s/$uuid/<uuid>/g"; else cat; fi; } > "$out"
+	[ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER" "$out" 2>/dev/null
+	printf 'Report written to %s\n' "$out"
+	more "Serial number and hardware UUID are removed. Read it before you post it, then attach it to an issue:"
+	more "$REPO/issues"
+}
+
 usage() {
 	cat <<EOF
 S0ixSleep setup assistant
 
   $0 check        look at this Mac and tell whether S0ixSleep fits it (changes nothing)
   sudo $0 install      put the kext in your OpenCore EFI and install the daemon, step by step
+  sudo $0 test         after the reboot: one sleep with a 60 s safety timer, explained
+  sudo $0 report       write a report for an issue (serial number removed) to the Desktop
   sudo $0 uninstall    remove the daemon, the kext and its config.plist entry
 
 Options for install and uninstall:
@@ -485,6 +627,8 @@ case "$cmd" in
 	check) cmd_check ;;
 	install) parse_opts "$@"; cmd_install ;;
 	uninstall) parse_opts "$@"; cmd_uninstall ;;
+	test) parse_opts "$@"; cmd_test ;;
+	report) cmd_report ;;
 	-h|--help|help|"") usage ;;
 	*) usage; exit 2 ;;
 esac
