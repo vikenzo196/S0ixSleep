@@ -62,6 +62,7 @@ stat_field() { printf '%s\n' "$STAT" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -
 cmd_check() {
 	local v major cpu sub esp oc ocver lilu s0ix pep lid ec bat gpu gfx sd hib route enable state
 
+	FAILS=0; WARNS=0
 	printf '%sS0ixSleep check%s: looks at this Mac, changes nothing.\n' "$B" "$N"
 	KEXTS=$(kmutil showloaded --list-only 2>/dev/null)
 	ACPI=$(ioreg -p IOACPIPlane -lw0 2>/dev/null)
@@ -178,16 +179,312 @@ cmd_check() {
 	[ "$FAILS" -eq 0 ]
 }
 
+# ---------------------------------------------------------------------------------------------------------
+# install / uninstall
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+PB=/usr/libexec/PlistBuddy
+DRY=0; YES=0; NODAEMON=0; EFI_DIR=; KEXT_SRC=
+ROOT=; EFI_DESC=; MOUNTED_BY_US=; TMP=
+
+parse_opts() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--dry-run) DRY=1 ;;
+			--yes|-y) YES=1 ;;
+			--no-daemon) NODAEMON=1 ;;
+			--efi) [ $# -ge 2 ] || { usage; exit 2; }; EFI_DIR=$2; shift ;;
+			--kext) [ $# -ge 2 ] || { usage; exit 2; }; KEXT_SRC=$2; shift ;;
+			*) usage; exit 2 ;;
+		esac
+		shift
+	done
+}
+
+cleanup() {
+	[ -n "$TMP" ] && rm -rf "$TMP"
+	[ -n "$MOUNTED_BY_US" ] && diskutil unmount "$MOUNTED_BY_US" >/dev/null 2>&1
+	TMP=; MOUNTED_BY_US=
+}
+trap cleanup EXIT
+die()  { printf '  %s[stop]%s %s\n' "$R" "$N" "$*"; exit 1; }
+step() { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+ask() {
+	local a
+	if [ "$YES" = 1 ]; then printf '%s [y/N] y\n' "$1"; return 0; fi
+	printf '%s [y/N] ' "$1"
+	read -r a </dev/tty || return 1
+	case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+need_root() {
+	if [ -n "$EFI_DIR" ] && [ "$NODAEMON" = 1 ]; then return; fi
+	[ "$(id -u)" = 0 ] || die "run it with sudo:  sudo $0 $*"
+}
+
+user_home() {
+	if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+		dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{ print $2 }'
+	else
+		echo "$HOME"
+	fi
+}
+
+# find_efi: sets ROOT (the folder holding EFI/) and EFI_DESC; mounts the ESP if needed
+find_efi() {
+	local esp dev mp
+	if [ -n "$EFI_DIR" ]; then
+		ROOT=$(cd "$EFI_DIR" 2>/dev/null && pwd) || die "no such folder: $EFI_DIR"
+		EFI_DESC="folder $ROOT"
+	else
+		esp=$(esp_of_opencore) || die "could not find the partition OpenCore started from (use --efi FOLDER)"
+		dev=${esp% *}
+		mp=$(diskutil info -plist "$dev" | plutil -extract MountPoint raw - 2>/dev/null)
+		if [ -z "$mp" ]; then
+			diskutil mount "$dev" >/dev/null 2>&1 || die "could not mount $dev"
+			MOUNTED_BY_US=$dev
+			mp=$(diskutil info -plist "$dev" | plutil -extract MountPoint raw - 2>/dev/null)
+		fi
+		ROOT=$mp
+		EFI_DESC="$dev (${esp#* } disk), mounted at $mp"
+	fi
+	[ -f "$ROOT/EFI/OC/config.plist" ] || die "no EFI/OC/config.plist in $ROOT"
+}
+
+# scan_config FILE: sets NKEXT, LILU_IDX, LILU_EN, S0IX_IDX, S0IX_EN
+scan_config() {
+	local bp
+	NKEXT=0; LILU_IDX=; LILU_EN=; S0IX_IDX=; S0IX_EN=
+	while bp=$($PB -c "Print :Kernel:Add:$NKEXT:BundlePath" "$1" 2>/dev/null); do
+		case "$bp" in
+			Lilu.kext) LILU_IDX=$NKEXT; LILU_EN=$($PB -c "Print :Kernel:Add:$NKEXT:Enabled" "$1" 2>/dev/null) ;;
+			S0ixSleep.kext) S0IX_IDX=$NKEXT; S0IX_EN=$($PB -c "Print :Kernel:Add:$NKEXT:Enabled" "$1" 2>/dev/null) ;;
+		esac
+		NKEXT=$((NKEXT + 1))
+	done
+}
+
+add_entry() { # add_entry FILE INDEX EXECUTABLE
+	local e=":Kernel:Add:$2"
+	$PB -c "Add $e dict" -c "Add $e:Arch string x86_64" -c "Add $e:BundlePath string S0ixSleep.kext" \
+		-c "Add $e:Comment string S0ixSleep (sleep without S3)" -c "Add $e:Enabled bool true" \
+		-c "Add $e:ExecutablePath string Contents/MacOS/$3" -c "Add $e:MaxKernel string" \
+		-c "Add $e:MinKernel string" -c "Add $e:PlistPath string Contents/Info.plist" "$1"
+}
+
+# backup_efi WHAT...: copies the files named (relative to EFI/OC) and a zip of EFI/OC to ~/S0ixSleep-backup/DATE
+backup_efi() {
+	local home f
+	home=$(user_home)
+	BK="$home/S0ixSleep-backup/$(date +%Y%m%d-%H%M%S)"
+	mkdir -p "$BK" || die "cannot create $BK"
+	for f in "$@"; do
+		[ -e "$ROOT/EFI/OC/$f" ] && ditto --norsrc --noextattr "$ROOT/EFI/OC/$f" "$BK/$(basename "$f")"
+	done
+	ditto -c -k --norsrc --keepParent "$ROOT/EFI/OC" "$BK/EFI-OC.zip" || die "backup of EFI/OC failed"
+	printf 'EFI: %s\nDate: %s\nRestore: copy config.plist back to EFI/OC/, or unzip EFI-OC.zip over EFI/\n' \
+		"$EFI_DESC" "$(date)" > "$BK/README.txt"
+	[ -n "${SUDO_USER:-}" ] && chown -R "$SUDO_USER" "$home/S0ixSleep-backup" 2>/dev/null
+	ok "backup in $BK"
+}
+
+copy_kext() {
+	local dst="$ROOT/EFI/OC/Kexts/S0ixSleep.kext"
+	rm -rf "$dst.new"
+	ditto --norsrc --noextattr --noqtn --noacl "$KEXT_SRC" "$dst.new" || die "could not copy the kext"
+	rm -rf "$dst" && mv "$dst.new" "$dst" || die "could not replace $dst"
+}
+
+kext_info() { $PB -c "Print :$2" "$1/Contents/Info.plist" 2>/dev/null; }
+
+cmd_install() {
+	local kver kexe dst dver kact cact dact free ocv
+	need_root install
+	printf '%sS0ixSleep install%s%s\n' "$B" "$N" "$([ "$DRY" = 1 ] && echo ' (dry run: nothing is written)')"
+
+	step "1/4  Check"
+	cmd_check >/dev/null 2>&1; local rc=$?
+	if [ "$rc" -ne 0 ]; then
+		cmd_check
+		die "the check found problems: fix the [fail] items first"
+	fi
+	ok "this Mac passes the check (details: $0 check)"
+	if [ -z "$(acpi_devices '"(INT33A1|PNP0D80)"')" ]; then
+		warn "no Modern Standby device: this firmware probably has working S3"
+		ask "Install anyway?" || die "nothing changed"
+	fi
+
+	step "2/4  What will change"
+	[ -n "$KEXT_SRC" ] || KEXT_SRC="$SCRIPT_DIR/../S0ixSleep.kext"
+	[ "$(kext_info "$KEXT_SRC" CFBundleIdentifier)" = "$KEXT_ID" ] || die "S0ixSleep.kext not found next to this script (use --kext PATH)"
+	KEXT_SRC=$(cd "$KEXT_SRC" && pwd)
+	kver=$(kext_info "$KEXT_SRC" CFBundleShortVersionString); kexe=$(kext_info "$KEXT_SRC" CFBundleExecutable)
+	[ -f "$KEXT_SRC/Contents/MacOS/$kexe" ] || die "the kext at $KEXT_SRC has no executable"
+
+	find_efi
+	scan_config "$ROOT/EFI/OC/config.plist"
+	[ -n "$LILU_IDX" ] || die "Lilu.kext is not in config.plist > Kernel > Add"
+	[ "$LILU_EN" = true ] || die "Lilu.kext is disabled in config.plist"
+
+	dst="$ROOT/EFI/OC/Kexts/S0ixSleep.kext"
+	if [ -d "$dst" ]; then
+		dver=$(kext_info "$dst" CFBundleShortVersionString)
+		if diff -rq "$KEXT_SRC" "$dst" >/dev/null 2>&1; then kact=same; else kact=replace; fi
+	else
+		kact=new
+	fi
+	if [ -z "$S0IX_IDX" ]; then cact=add
+	elif [ "$S0IX_IDX" -lt "$LILU_IDX" ]; then cact=move
+	elif [ "$S0IX_EN" != true ]; then cact=enable
+	else cact=none; fi
+	if [ "$NODAEMON" = 1 ]; then dact=skip
+	elif [ -f "/Library/LaunchDaemons/$LABEL.plist" ]; then dact=update
+	else dact=new; fi
+
+	info "EFI:     $EFI_DESC"
+	case $kact in
+		new)     info "kext:    copy S0ixSleep.kext $kver to EFI/OC/Kexts" ;;
+		replace) info "kext:    replace S0ixSleep.kext ${dver:-?} in EFI/OC/Kexts with $kver" ;;
+		same)    info "kext:    S0ixSleep.kext $kver already in EFI/OC/Kexts: no change" ;;
+	esac
+	case $cact in
+		add)    info "config:  Kernel > Add: new entry for S0ixSleep.kext right after Lilu.kext" ;;
+		move)   info "config:  Kernel > Add: move the S0ixSleep.kext entry after Lilu.kext" ;;
+		enable) info "config:  Kernel > Add: enable the S0ixSleep.kext entry" ;;
+		none)   info "config:  S0ixSleep.kext already listed after Lilu and enabled: no change" ;;
+	esac
+	case $dact in
+		new)    info "daemon:  install $LABEL (sleep stays disabled until the kext runs)" ;;
+		update) info "daemon:  update the daemon script (your /usr/local/etc/s0ixsleep.conf is kept)" ;;
+		skip)   info "daemon:  skipped (--no-daemon)" ;;
+	esac
+	if [ "$kact" != same ] || [ "$cact" != none ]; then
+		info "backup:  config.plist and a zip of EFI/OC go to ~/S0ixSleep-backup first"
+	fi
+
+	if [ "$DRY" = 1 ]; then printf '\nDry run: nothing written.\n'; return 0; fi
+	if [ "$kact" = same ] && [ "$cact" = none ] && [ "$dact" = skip ]; then printf '\nNothing to do.\n'; return 0; fi
+	echo
+	ask "Go ahead?" || die "nothing changed"
+
+	step "3/4  EFI"
+	if [ "$kact" != same ] || [ "$cact" != none ]; then
+		backup_efi config.plist Kexts/S0ixSleep.kext
+		TMP=$(mktemp -d /tmp/s0ixsleep.XXXXXX)
+		cp "$ROOT/EFI/OC/config.plist" "$TMP/config.plist"
+		case $cact in
+			add) add_entry "$TMP/config.plist" $((LILU_IDX + 1)) "$kexe" ;;
+			move)
+				$PB -c "Delete :Kernel:Add:$S0IX_IDX" "$TMP/config.plist"
+				scan_config "$TMP/config.plist"
+				add_entry "$TMP/config.plist" $((LILU_IDX + 1)) "$kexe" ;;
+			enable) $PB -c "Set :Kernel:Add:$S0IX_IDX:Enabled true" "$TMP/config.plist" ;;
+		esac
+		plutil -lint -s "$TMP/config.plist" || die "the edited config.plist is not valid: the EFI was not changed"
+		scan_config "$TMP/config.plist"
+		[ -n "$S0IX_IDX" ] && [ "$S0IX_IDX" -gt "$LILU_IDX" ] && [ "$S0IX_EN" = true ] ||
+			die "the edited config.plist does not look right: the EFI was not changed"
+		ocv=$(command -v ocvalidate 2>/dev/null || true)
+		[ -x "$SCRIPT_DIR/../Utilities/ocvalidate" ] && ocv="$SCRIPT_DIR/../Utilities/ocvalidate"
+		if [ -n "$ocv" ]; then
+			if "$ocv" "$TMP/config.plist" >/dev/null 2>&1; then ok "ocvalidate: no problems"
+			else warn "ocvalidate reports problems (maybe already there before, or a different OpenCore version):"
+				"$ocv" "$TMP/config.plist" 2>&1 | tail -5 | sed 's/^/         /'
+				ask "Write the config anyway?" || die "the EFI was not changed"
+			fi
+		fi
+		if [ "$kact" != same ]; then
+			free=$(df -k "$ROOT" | awk 'NR == 2 { print $4 }')
+			[ "${free:-0}" -gt 1024 ] || die "less than 1 MB free on the EFI partition"
+			copy_kext
+			ok "S0ixSleep.kext $kver copied"
+		fi
+		if [ "$cact" != none ]; then
+			cp "$TMP/config.plist" "$ROOT/EFI/OC/config.plist" || die "could not write config.plist (backup in $BK)"
+			ok "config.plist updated (S0ixSleep.kext is entry $S0IX_IDX, Lilu.kext entry $LILU_IDX)"
+		fi
+	else
+		ok "EFI already up to date"
+	fi
+
+	step "4/4  Daemon"
+	if [ "$dact" = skip ]; then
+		info "skipped"
+	else
+		"$SCRIPT_DIR/install.sh" >/dev/null 2>&1 || die "the daemon install failed (sudo $SCRIPT_DIR/install.sh shows why)"
+		ok "daemon $LABEL installed"
+		info "sleep: $(pmset -g | awk '$1 == "SleepDisabled" { print ($2 == 1 ? "disabled until the kext runs" : "allowed") }')"
+	fi
+
+	step "Done"
+	more "1. Reboot."
+	more "2. Then run:  sudo $0 test   (a first sleep with a 60 s safety timer)"
+	more "Optional: the ACPI part turns the fans and power LED off during sleep; it depends on the laptop."
+	more "See docs/ACPI.md. Undo everything with:  sudo $0 uninstall"
+}
+
+cmd_uninstall() {
+	local dst cact kact
+	need_root uninstall
+	printf '%sS0ixSleep uninstall%s%s\n' "$B" "$N" "$([ "$DRY" = 1 ] && echo ' (dry run: nothing is written)')"
+	find_efi
+	scan_config "$ROOT/EFI/OC/config.plist"
+	dst="$ROOT/EFI/OC/Kexts/S0ixSleep.kext"
+	if [ -n "$S0IX_IDX" ]; then cact=remove; else cact=none; fi
+	if [ -d "$dst" ]; then kact=remove; else kact=none; fi
+
+	step "What will change"
+	info "EFI:     $EFI_DESC"
+	[ "$cact" = remove ] && info "config:  remove the S0ixSleep.kext entry from Kernel > Add" || info "config:  no S0ixSleep.kext entry"
+	[ "$kact" = remove ] && info "kext:    delete EFI/OC/Kexts/S0ixSleep.kext" || info "kext:    not in EFI/OC/Kexts"
+	[ "$NODAEMON" = 1 ] && info "daemon:  skipped (--no-daemon)" || info "daemon:  remove it and disable sleep again (your s0ixsleep.conf is kept)"
+	more "ACPI tables or patches you added for S0ixSleep (docs/ACPI.md) stay: remove them yourself if you want."
+	if [ "$DRY" = 1 ]; then printf '\nDry run: nothing written.\n'; return 0; fi
+	echo
+	ask "Go ahead?" || die "nothing changed"
+
+	if [ "$NODAEMON" != 1 ]; then
+		"$SCRIPT_DIR/uninstall.sh" >/dev/null 2>&1
+		ok "daemon removed, sleep disabled"
+	fi
+	if [ "$cact" = remove ] || [ "$kact" = remove ]; then
+		backup_efi config.plist Kexts/S0ixSleep.kext
+		if [ "$cact" = remove ]; then
+			TMP=$(mktemp -d /tmp/s0ixsleep.XXXXXX)
+			cp "$ROOT/EFI/OC/config.plist" "$TMP/config.plist"
+			$PB -c "Delete :Kernel:Add:$S0IX_IDX" "$TMP/config.plist"
+			plutil -lint -s "$TMP/config.plist" || die "the edited config.plist is not valid: the EFI was not changed"
+			cp "$TMP/config.plist" "$ROOT/EFI/OC/config.plist" || die "could not write config.plist (backup in $BK)"
+			ok "S0ixSleep.kext removed from config.plist"
+		fi
+		[ "$kact" = remove ] && rm -rf "$dst" && ok "EFI/OC/Kexts/S0ixSleep.kext deleted"
+	fi
+	step "Done"
+	more "Reboot to unload the kext. Sleep stays disabled."
+}
+
 usage() {
 	cat <<EOF
 S0ixSleep setup assistant
 
-  $0 check    look at this Mac and tell whether S0ixSleep fits it (changes nothing)
+  $0 check        look at this Mac and tell whether S0ixSleep fits it (changes nothing)
+  sudo $0 install      put the kext in your OpenCore EFI and install the daemon, step by step
+  sudo $0 uninstall    remove the daemon, the kext and its config.plist entry
+
+Options for install and uninstall:
+  --dry-run       show what would change, write nothing
+  --efi FOLDER    use FOLDER/EFI instead of the EFI partition OpenCore started from
+  --kext PATH     use this S0ixSleep.kext (default: the one next to the scripts folder)
+  --no-daemon     leave the daemon alone (EFI only)
+  --yes           do not ask for confirmation
 EOF
 }
 
-case "${1:-}" in
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
 	check) cmd_check ;;
+	install) parse_opts "$@"; cmd_install ;;
+	uninstall) parse_opts "$@"; cmd_uninstall ;;
 	-h|--help|help|"") usage ;;
 	*) usage; exit 2 ;;
 esac
