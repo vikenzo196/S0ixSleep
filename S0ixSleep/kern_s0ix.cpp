@@ -312,6 +312,7 @@ constexpr unsigned PmcDwords = 3 + 2 + 48 + 1 + 1 + 48;
 IOMemoryMap *pmcMap = nullptr;
 volatile uint32_t *pmcMmio = nullptr;
 uint64_t pmcBase = 0;
+uint32_t pmcEvalErr = 0, pmcSource = 0;   // source: 1 \\PWRM, 2 default 0xFE000000
 uint32_t pmcStart[PmcDwords], pmcEnd[PmcDwords];
 bool pmcHave = false;
 
@@ -321,15 +322,30 @@ void pmcSnapshot(uint32_t *out) {
 		for (unsigned i = 0; i < r.count; i++) out[k++] = pmcMmio[(r.off + 4 * i) / 4];
 }
 
-void preparePmc() {
-	if (!pmcDiag || pmcMmio || intel != 1 || !ecDevice) return;
-	UInt32 base = 0;
-	if (ecDevice->evaluateInteger("\\PWRM", &base) != kIOReturnSuccess || !base || (base & 0xFFF)) return;
+bool mapPmc(uint64_t base) {
+	IOMemoryMap *m = nullptr;
 	if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(base, 0x2000, kIODirectionInOut)) {
-		pmcMap = md->map(kIOMapInhibitCache);
+		m = md->map(kIOMapInhibitCache);
 		md->release();
 	}
-	if (pmcMap) { pmcMmio = reinterpret_cast<volatile uint32_t *>(pmcMap->getVirtualAddress()); pmcBase = base; }
+	if (!m) return false;
+	auto *r = reinterpret_cast<volatile uint32_t *>(m->getVirtualAddress());
+	// Plausibility: an unclaimed MMIO range reads all ones; the aggregated LTR register of a PMC does not.
+	if (r[0x1B54 / 4] == 0xFFFFFFFFU && r[0x1B60 / 4] == 0xFFFFFFFFU) { m->release(); return false; }
+	pmcMap = m;
+	pmcMmio = r;
+	pmcBase = base;
+	return true;
+}
+
+void preparePmc() {
+	if (!pmcDiag || pmcMmio || intel != 1) return;
+	UInt32 base = 0;
+	const IOReturn e = ecDevice ? ecDevice->evaluateInteger("\\PWRM", &base) : kIOReturnNotFound;
+	pmcEvalErr = (uint32_t)e;
+	if (e == kIOReturnSuccess && base && !(base & 0xFFF) && mapPmc(base)) { pmcSource = 1; return; }
+	// Cannon Point to Alder Point keep the PMC at this fixed address (Linux intel_pmc_core does the same).
+	if (mapPmc(0xFE000000ULL)) pmcSource = 2;
 }
 
 // ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
@@ -647,7 +663,7 @@ int pmcHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		for (unsigned i = 0; i < PmcDwords && u + 10 < sizeof(pmcText); i++)
 			u += (size_t)snprintf(pmcText + u, sizeof(pmcText) - u, i ? ",%08x" : "%08x", v[i]);
 	};
-	u = (size_t)snprintf(pmcText, sizeof(pmcText), "base=0x%llx ranges=", pmcBase);
+	u = (size_t)snprintf(pmcText, sizeof(pmcText), "base=0x%llx source=%u pwrm_err=0x%x ranges=", pmcBase, pmcSource, pmcEvalErr);
 	for (const auto &r : PmcRanges) u += (size_t)snprintf(pmcText + u, sizeof(pmcText) - u, "%x:%u,", r.off, r.count);
 	if (pmcMmio) {
 		uint32_t live[PmcDwords];
