@@ -113,7 +113,8 @@ while :; do
   [ "$woke" = 0 ] && continue
   since=$(( $(date +%s) - woke ))
   if [ "$checked" = 0 ] && [ "$since" -ge 5 ]; then checked=1; check_battery "$LOW_BATTERY_SLEEP" "after sleep"; fi
-  if [ "$guard" = 1 ] && [ "$BAG_GUARD" -gt 0 ] 2>/dev/null; then
+  # /var/run/s0ixsleep-keepawake (removed at reboot) holds the bag guard off, e.g. for remote or scripted work.
+  if [ "$guard" = 1 ] && [ "$BAG_GUARD" -gt 0 ] 2>/dev/null && [ ! -e /var/run/s0ixsleep-keepawake ]; then
     idle_s=$(hid_idle)
     # Input in the first 10 s belongs to the wake itself (key, lid, or the event that woke it).
     if [ -n "$idle_s" ] && [ "$since" -ge 10 ] && [ "$idle_s" -lt $((since - 10)) ]; then guard=0   # in use
