@@ -491,6 +491,7 @@ describe_reason() { # describe_reason REASON ECGPE
 		1) echo "the power button" ;;
 		2) echo "an RTC alarm (a wake macOS scheduled, for example for maintenance)" ;;
 		3) echo "the 60 s safety timer: nothing else woke it" ;;
+		4) echo "the lid (its state read from the embedded controller, LID_EC)" ;;
 		*) if [ $r -ge 256 ] && [ $((r - 256)) -eq "$e" ]; then echo "an embedded controller event"
 		   elif [ $r -ge 256 ]; then printf 'general purpose event 0x%x (lid, keyboard, USB or another device the OS armed)\n' $((r - 256))
 		   else echo "unknown ($1)"; fi ;;
@@ -571,6 +572,7 @@ cmd_test() {
 	elif [ $((reason)) -eq 3 ]; then
 		echo
 		more "Now try the lid: close it, wait 15 s, open it. The laptop should wake in a few seconds."
+		more "If the lid sometimes does not wake it, see LID_EC in $CONF."
 	fi
 	echo
 	more "If the display came back wrong or black, see $REPO#graphics"

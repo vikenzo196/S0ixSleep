@@ -144,13 +144,29 @@ sysctl debug.s0ix.stat
 |---|---|
 | `route` | 1 = hooked. 2 = symbol not found, 3 = unexpected code (macOS version not supported) |
 | `platform` | 1 = FADT read. `pm1`, `gpe0` (port/bytes), `ec` (command/data ports), `ecgpe`: what it found |
-| `sleeps`, `reason` | completed sleeps and last wake reason: 1 power button, 2 RTC, 3 safety timer, `0x100` + GPE number |
+| `sleeps`, `reason` | completed sleeps and last wake reason: 1 power button, 2 RTC, 3 safety timer, 4 lid opened (state read from the EC, `LID_EC`), `0x100` + GPE number |
 | `ms`, `pkg_mw`, `core_mw` | length of the last sleep, average package and core power during it |
 | `mwait`, `timer_irqs`, `core_c7_ms`, `mwait_fail` | 1 = last sleep used `wait 2`; timer wakes; core C7 time; why `wait 2` was not entered (1 APIC mode changed, 2 IDT) |
 | `ec_q`, `ec_ign`, `replayed` | last embedded controller events read during sleep (newest first), events ignored, `_Qxx` replayed after the last wake / in total |
 | `userwake` | full wakes requested after a user wake |
 | `hooks` | wait hooks added by other kexts / calls (see [Graphics](#graphics)) |
+| `lid_ec`, `lid` | lid state location in EC RAM (`LID_EC`); its value at sleep entry > last value read / read errors |
+| `wake_gpe`, `gpe_sts` | extra wake GPEs (`WAKE_GPE`); GPE0 status at sleep entry > at wake |
 | `pc`, `res_ok` | package C-state residency of the last sleep, per mille (PC2,3,6,7,8,9,10) |
+
+### Lid that does not always wake the laptop
+
+Opening the lid normally wakes the laptop through an embedded controller event (a `_Qxx` method that notifies
+the lid device). Some ECs do not always send it after a long sleep. `LID_EC` makes S0ixSleep read the lid state
+from the EC's RAM every 500 ms during the sleep and wake when it changes from closed to open (`reason` 4):
+
+```
+LID_EC=83.0      # EC RAM byte 0x83, bit 0, 1 = open (~83.0 if 0 = open)
+```
+
+Find it in your DSDT: the field of the EC's `EmbeddedControl` region that the lid's `_Qxx` method copies into
+the variable `_LID` returns (on the Samsung Galaxy Book3 it is `LSTE`, `Offset (0x83)`, bit 0). Each read is a
+short EC transaction; the measured package power did not change.
 
 ### Spurious wakes: embedded controller events
 

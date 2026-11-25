@@ -23,3 +23,10 @@ The tested machine. Galaxy Book2/Book3 models share most of this firmware; check
   Power button `_Q50` and lid `_Q5E`/`_Q5F` still wake.
 - Graphics: WhateverXe fork (Iris Xe, OLED with DSC) with `-wex-s0ixsleep`; it resets the GT from an S0ixSleep
   wait hook and keeps the panel dark through the sleep.
+
+## Lid
+
+The lid's EC event is `_Q5F`, which copies `LSTE` (EC RAM byte 0x83, bit 0) into `LIDS`. After some sleeps the
+EC does not send `_Q5F` when the lid opens, so also set `LID_EC=83.0` in `s0ixsleep.conf`: S0ixSleep then reads
+`LSTE` during the sleep and wakes when the lid opens. (`_L12`, GPE 0x12, also handles the lid in the firmware, but
+that GPE does not fire under macOS.)
