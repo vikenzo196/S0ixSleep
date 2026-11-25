@@ -132,6 +132,10 @@ int ecReplay = 1;       // 1 = run the _Qxx methods of the EC events consumed du
 int pmcDiag = 0;        // 1 = snapshot Intel PCH PMC registers (LTR, power gating, SLP_S0) around each sleep
 uint32_t ecIgnore[8], ecWake[8];
 char ecIgnoreText[200], ecWakeText[200];
+// Extra GPEs whose status may end the wait although the OS did not arm them (for example a lid GPIO that has
+// no _PRW). Their status is cleared when the wait starts, so a source that stays asserted never wakes it.
+uint32_t wakeGpe[8];
+char wakeGpeText[200];
 
 // ─── platform, read when the sleep is enabled ──────────────────────────────────────────────────
 bool platformReady = false;
@@ -150,7 +154,7 @@ int route = 0;
 uint32_t lastReason = 0, ecIgnored = 0, ecLast[4] = {0x1FF, 0x1FF, 0x1FF, 0x1FF}, userWakes = 0, gtResult = 0;
 uint64_t lastLoops = 0, lastMs = 0, lastPkgMw = 0, lastCoreMw = 0, lastHwp = 0;
 uint32_t lastMwait = 0;   // 1 = last wait used MWAIT, 2 = asked for but not entered (see mwait_fail)
-uint8_t gpeEn[MaxGpeBytes];
+uint8_t gpeEn[MaxGpeBytes], gpeStsStart[MaxGpeBytes], gpeStsEnd[MaxGpeBytes];
 volatile bool userWakePending = false;
 thread_call_t userWakeCall = nullptr;
 // EC events consumed during the wait, replayed after wake.
@@ -488,10 +492,17 @@ void leaveMwait(const ApicSave &s) {
 // ─── the wait ───────────────────────────────────────────────────────────────────────────────────
 void s0ixWait(void *) {
 	runHooks(S0ixHookEnter, 0);
-	uint8_t snap[MaxGpeBytes];
+	uint8_t snap[MaxGpeBytes], extra[MaxGpeBytes];
 	const unsigned nb = gpe0Bytes;
-	// Only GPEs the OS armed for wake (GPE0 enable) may end the wait.
-	for (unsigned i = 0; i < nb; i++) { snap[i] = inb(port(gpe0Sts, i)); gpeEn[i] = inb(port(gpe0Sts, nb + i)); }
+	// Only GPEs the OS armed for wake (GPE0 enable) may end the wait, plus the extra wake GPEs.
+	for (unsigned i = 0; i < nb; i++) {
+		extra[i] = (uint8_t)(wakeGpe[i >> 2] >> ((i & 3) * 8));
+		if (extra[i]) outb(port(gpe0Sts, i), extra[i]);   // write 1 to clear a stale status
+	}
+	for (unsigned i = 0; i < nb; i++) {
+		snap[i] = gpeStsStart[i] = inb(port(gpe0Sts, i));
+		gpeEn[i] = inb(port(gpe0Sts, nb + i));
+	}
 	outw(pm1Sts, Pm1PwrBtn | Pm1Rtc);   // write 1 to clear
 	uint32_t reason = 0;
 	uint64_t loops = 0;
@@ -526,7 +537,7 @@ void s0ixWait(void *) {
 		if (pm1 & Pm1PwrBtn) reason = 1;
 		else if (pm1 & Pm1Rtc) reason = 2;
 		else for (unsigned i = 0; i < nb; i++) {
-			const uint8_t g = inb(port(gpe0Sts, i)), rise = g & ~snap[i] & gpeEn[i];
+			const uint8_t g = inb(port(gpe0Sts, i)), rise = g & ~snap[i] & (gpeEn[i] | extra[i]);
 			if (rise) {
 				const unsigned gpe = i * 8 + (unsigned)__builtin_ctz(rise);
 				if ((int)gpe == ecGpe && rise == (1U << (gpe & 7)) && !(kbc == 1 && (inb(0x64) & 1))) {
@@ -561,6 +572,12 @@ void s0ixWait(void *) {
 		leaveMwait(as);
 	} else mwaitIrqs = 0;
 	lastMwait = mw ? 1 : (wait == 2 ? 2 : 0);
+	for (unsigned i = 0; i < nb; i++) gpeStsEnd[i] = inb(port(gpe0Sts, i));
+	if (reason >= 0x100) {   // an extra wake GPE has no handler in the OS: clear its status here
+		const unsigned g = reason - 0x100, i = g >> 3;
+		const uint8_t bit = (uint8_t)(1U << (g & 7));
+		if (i < nb && (extra[i] & bit) && !(gpeEn[i] & bit)) outb(port(gpe0Sts, i), bit);
+	}
 	if (pmc) { pmcSnapshot(pmcEnd); pmcHave = true; }
 	{
 		const uint64_t dt = rdtsc() - t0;
@@ -734,8 +751,8 @@ bool parseList(const char *s, uint32_t *map, char *text, size_t size) {
 }
 
 int listHandler(struct sysctl_oid *oidp, void *, int arg2, struct sysctl_req *req) {
-	uint32_t *map = arg2 ? ecWake : ecIgnore;
-	char *text = arg2 ? ecWakeText : ecIgnoreText;
+	uint32_t *map = arg2 == 2 ? wakeGpe : arg2 ? ecWake : ecIgnore;
+	char *text = arg2 == 2 ? wakeGpeText : arg2 ? ecWakeText : ecIgnoreText;
 	char buf[200];
 	strlcpy(buf, text, sizeof(buf));
 	const int error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
@@ -743,23 +760,31 @@ int listHandler(struct sysctl_oid *oidp, void *, int arg2, struct sysctl_req *re
 	return parseList(buf, map, text, sizeof(ecIgnoreText)) ? 0 : EINVAL;
 }
 
-char statText[760];
+char statText[1024];
 int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	char en[2 * MaxGpeBytes + 1];
 	size_t u = 0;
 	en[0] = '\0';
-	for (unsigned i = 0; i < gpe0Bytes && u + 3 <= sizeof(en); i++) u += (size_t)snprintf(en + u, sizeof(en) - u, "%02x", gpeEn[i]);
+	char s0[2 * MaxGpeBytes + 1], s1[2 * MaxGpeBytes + 1];
+	size_t u0 = 0, u1 = 0;
+	s0[0] = s1[0] = '\0';
+	for (unsigned i = 0; i < gpe0Bytes && u + 3 <= sizeof(en); i++) {
+		u += (size_t)snprintf(en + u, sizeof(en) - u, "%02x", gpeEn[i]);
+		u0 += (size_t)snprintf(s0 + u0, sizeof(s0) - u0, "%02x", gpeStsStart[i]);
+		u1 += (size_t)snprintf(s1 + u1, sizeof(s1) - u1, "%02x", gpeStsEnd[i]);
+	}
 	snprintf(statText, sizeof(statText),
 		"route=%d enable=%d platform=%d lps0=%d pm1=0x%x gpe0=0x%x/%u ec=0x%x/0x%x ecgpe=%d kbc=%d intel=%d hwp_cap=%d waitpkg=%d tsc_ms=%llu"
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		" pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u",
+		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
-		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal);
+		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
+		wakeGpeText[0] ? wakeGpeText : "-", s0, s1);
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -776,12 +801,14 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0,
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, gtreset, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, gtHandler, "I", "1 = reset the Intel GT on wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_ignore, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, listHandler, "A", "EC events that do not wake (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_wake, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 1, listHandler, "A", "only these EC events wake (hex)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, wake_gpe, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 2, listHandler, "A", "extra GPEs that wake (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, stat, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, statHandler, "A", "status");
 
 void S0ix::install(KernelPatcher &patcher) {
 	char arg[200];
 	if (PE_parse_boot_argn("s0ixecign", arg, sizeof(arg))) parseList(arg, ecIgnore, ecIgnoreText, sizeof(ecIgnoreText));
 	if (PE_parse_boot_argn("s0ixecwake", arg, sizeof(arg))) parseList(arg, ecWake, ecWakeText, sizeof(ecWakeText));
+	if (PE_parse_boot_argn("s0ixwakegpe", arg, sizeof(arg))) parseList(arg, wakeGpe, wakeGpeText, sizeof(wakeGpeText));
 
 	const mach_vm_address_t fn = patcher.solveSymbol(KernelPatcher::KernelID, "_acpi_sleep_kernel");
 	patcher.clearError();
@@ -818,6 +845,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_gtreset);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_ignore);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_wake);
+	sysctl_register_oid(&sysctl__debug_s0ix_wake_gpe);
 	sysctl_register_oid(&sysctl__debug_s0ix_stat);
 	SYSLOG("s0ix", "acpi_sleep_kernel route %d, requestUserActive %s", route, requestUserActive ? "found" : "missing");
 }
