@@ -1,6 +1,11 @@
-# S0ixSleep
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/wordmark-dark.svg">
+    <img alt="S0ixSleep" src="docs/logo/wordmark-light.svg" width="393">
+  </picture>
+</h1>
 
-Sleep for Hackintosh laptops whose firmware has no S3.
+<p align="center">Sleep for Hackintosh laptops whose firmware has no S3.</p>
 
 Most laptops released since about 2020 only support Modern Standby (S0ix): the firmware no longer
 implements S3 (suspend to RAM). macOS only knows S3, so on these machines closing the lid or choosing
