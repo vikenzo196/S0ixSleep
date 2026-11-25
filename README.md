@@ -75,6 +75,28 @@ difference, and macOS already turns the NVMe controller off at every sleep.
 
 ## Installation
 
+The setup assistant does it step by step and shows every change before it makes it:
+
+```
+cd S0ixSleep-x.y.z
+./scripts/s0ixsleep-setup.sh check           # does S0ixSleep fit this Mac? (changes nothing)
+sudo ./scripts/s0ixsleep-setup.sh install    # kext into your OpenCore EFI (after a backup), then the daemon
+# reboot
+sudo ./scripts/s0ixsleep-setup.sh test       # a first sleep with a 60 s safety timer, explained
+```
+
+- `install` finds the EFI partition OpenCore started from, backs up `config.plist` and the whole `EFI/OC`
+  folder to `~/S0ixSleep-backup`, copies the kext and adds it to Kernel → Add right after Lilu.
+  `--dry-run` shows the changes without writing anything.
+- `test` tells what woke the laptop. If an embedded controller event woke it while nobody touched it, it
+  offers to add that event to `EC_IGNORE` (see [Spurious wakes](#spurious-wakes-embedded-controller-events)).
+- `report` writes a report for an issue to the Desktop, with the serial number removed.
+- `uninstall` removes the daemon, the kext and its `config.plist` entry.
+
+The ACPI part ([docs/ACPI.md](docs/ACPI.md)) depends on the laptop and stays manual.
+
+### By hand
+
 1. Add `S0ixSleep.kext` to `EFI/OC/Kexts` and to `config.plist` → Kernel → Add, **after Lilu**.
 2. Optional but recommended: the ACPI part, see [docs/ACPI.md](docs/ACPI.md).
 3. Reboot, then install the daemon:
