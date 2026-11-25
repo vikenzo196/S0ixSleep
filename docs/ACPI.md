@@ -58,3 +58,13 @@ and check what it does.
 Only GPEs that macOS armed for wake can end the sleep. If opening the lid does not wake the laptop, check
 that the lid device (`PNP0C0D`) has a `_PRW` and that macOS shows it as a wake source
 (`pmset -g log | grep -i wake`).
+
+## Lid state after a timer wake
+
+Firmware written for S3 often assumes that a wake from S3 means the lid was opened: its `_WAK` sets the
+variable `_LID` returns to "open" and notifies the lid device. With S0ixSleep the machine also wakes from its
+safety timer (hourly dark wakes), with the lid still closed. macOS then turns the display on and believes the
+lid is open, and the next real lid opening may not wake the machine. Look for something like `LIDS = One`
+(or `Local0 = One` stored into the lid variable) in the methods `_WAK` calls. The fix is to run that `_WAK`
+code with the lid variable already "open" (no change, no notify), put the old value back, and publish the lid
+state the embedded controller really reports, only if it changed: see the Samsung example.
