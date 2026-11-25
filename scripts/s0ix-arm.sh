@@ -11,7 +11,10 @@
 #    seconds after a wake (SAFETY in s0ixsleep.conf wakes the machine in the dark periodically for this), or
 #    at or below LOW_BATTERY_AWAKE % at any time;
 #  - bag guard: after a wake, if nobody touched the keyboard or trackpad and the display is off for
-#    BAG_GUARD seconds, back to sleep (a wake nobody asked for must not keep the laptop running in a bag).
+#    BAG_GUARD seconds, back to sleep (a wake nobody asked for must not keep the laptop running in a bag);
+#  - network off while asleep: the interfaces in SLEEP_IF_DOWN go down while the lid is closed and no display
+#    is on (so not in clamshell mode with an external monitor), and come back when the lid opens or a display
+#    turns on. Wi-Fi drivers that keep the card active through sleep (itlwm) cost about 1 W.
 # Kill switch: create /usr/local/etc/s0ixsleep-off and reboot (sleep stays disabled).
 export PATH=/usr/sbin:/usr/bin:/bin:/sbin
 CONF=/usr/local/etc/s0ixsleep.conf
@@ -19,7 +22,7 @@ LOG=/var/log/s0ixsleep.log
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 safe() { pmset -a disablesleep 1; log "$1: sleep disabled"; }
 idle() { while :; do sleep 3600 & wait $!; done; }
-trap 'safe "shutdown"; exit 0' TERM INT
+trap 'safe "shutdown"; [ "${net_down:-0}" = 1 ] && for i in $SLEEP_IF_DOWN; do if_set "$i" up; done; exit 0' TERM INT
 
 pmset -a disablesleep 1
 log "start"
@@ -32,7 +35,7 @@ fi
 
 # Configuration: KEY=value lines, see s0ixsleep.conf.
 WAIT=2; PERIOD=50; SAFETY=3600; GT_RESET=0; EC_IGNORE=; EC_WAKE=; EC_REPLAY=1
-LOW_BATTERY_SLEEP=10; LOW_BATTERY_AWAKE=4; BAG_GUARD=60
+LOW_BATTERY_SLEEP=10; LOW_BATTERY_AWAKE=4; BAG_GUARD=60; SLEEP_IF_DOWN=
 [ -f "$CONF" ] && . "$CONF"
 sysctl -w debug.s0ix.period="$PERIOD" >/dev/null
 if ! sysctl -w debug.s0ix.wait="$WAIT" >/dev/null 2>&1; then
@@ -72,6 +75,20 @@ check_battery() {   # $1 threshold, $2 label
 }
 hid_idle() { ioreg -c IOHIDSystem -d 4 -r -k HIDIdleTime 2>/dev/null | awk '/HIDIdleTime/ {print int($NF / 1000000000); exit}'; }
 display_on() { pmset -g powerstate IODisplayWrangler 2>/dev/null | awk '$1 == "IODisplayWrangler" {exit !($2 >= 4)}'; }
+# Lid closed and the lid makes the machine sleep (macOS sets AppleClamshellCausesSleep No with an external display).
+lid_closed() {
+  ioreg -rc IOPMrootDomain -d1 2>/dev/null | awk -F'= ' '/"AppleClamshellState"/ {c = ($2 == "Yes")} /"AppleClamshellCausesSleep"/ {s = ($2 == "Yes")} END {exit !(c && s)}'
+}
+# Native Wi-Fi through networksetup, anything else (itlwm, Ethernet) through ifconfig.
+if_set() {   # $1 interface, $2 up|down
+  if networksetup -listallhardwareports 2>/dev/null |
+     awk -v d="$1" '/^Hardware Port:/ {p = $0} $0 == "Device: " d {f = (p ~ /Wi-Fi|AirPort/)} END {exit !f}'; then
+    networksetup -setairportpower "$1" "$([ "$2" = up ] && echo on || echo off)"
+  else
+    ifconfig "$1" "$2"
+  fi
+}
+net_down=0
 
 last=$(field sleeps); woke=0; checked=1; guard=0; n=0
 while :; do
@@ -80,6 +97,13 @@ while :; do
   if [ $((n % 30)) = 0 ]; then
     if [ "$(sysctl -n debug.s0ix.enable 2>/dev/null)" != 1 ]; then safe "S0ixSleep disabled"; idle; fi
     check_battery "$LOW_BATTERY_AWAKE" awake
+  fi
+  if [ -n "$SLEEP_IF_DOWN" ]; then
+    if [ "$net_down" = 0 ] && lid_closed && ! display_on; then
+      for i in $SLEEP_IF_DOWN; do if_set "$i" down; done; net_down=1; log "lid closed, display off: $SLEEP_IF_DOWN down"
+    elif [ "$net_down" = 1 ] && { ! lid_closed || display_on; }; then
+      for i in $SLEEP_IF_DOWN; do if_set "$i" up; done; net_down=0; log "lid open or display on: $SLEEP_IF_DOWN up"
+    fi
   fi
   s=$(field sleeps)
   if [ -n "$s" ] && [ "$s" != "$last" ]; then
