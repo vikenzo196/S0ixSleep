@@ -136,6 +136,13 @@ char ecIgnoreText[200], ecWakeText[200];
 // no _PRW). Their status is cleared when the wait starts, so a source that stays asserted never wakes it.
 uint32_t wakeGpe[8];
 char wakeGpeText[200];
+// Lid state in EC RAM (byte lidAddr, bit lidBit, 1 = open unless lidInvert), read every 500 ms during the wait: the
+// lid wakes the machine even when the EC does not send its lid event. -1 = off.
+int lidAddr = -1, lidBit = 0;
+bool lidInvert = false;
+char lidText[16] = "-";
+int lidEntry = -1, lidLast = -1;
+uint32_t lidErrors = 0;
 
 // ─── platform, read when the sleep is enabled ──────────────────────────────────────────────────
 bool platformReady = false;
@@ -206,6 +213,17 @@ uint32_t ecQuery() {
 	if (!ecWaitFor(false)) return 0x101;
 	outb(ecCmd, 0x84);                        // QR_EC
 	if (!ecWaitFor(true)) return 0x102;
+	return inb(ecData);
+}
+
+// Reads one byte of EC RAM (RD_EC), or -1 on timeout.
+int ecRead(uint8_t addr) {
+	if (inb(ecCmd) & 1) (void)inb(ecData);    // drop a stale output byte
+	if (!ecWaitFor(false)) return -1;
+	outb(ecCmd, 0x80);                        // RD_EC
+	if (!ecWaitFor(false)) return -1;
+	outb(ecData, addr);
+	if (!ecWaitFor(true)) return -1;
 	return inb(ecData);
 }
 
@@ -532,6 +550,32 @@ void s0ixWait(void *) {
 	const uint64_t mwPeriod = tpms * (uint64_t)periodMs;
 	const uint32_t irq0 = gS0ixTimerIrqs;
 	const uint64_t c70 = mw && (rok & (1U << 7)) ? rdmsr(0x3FE) : 0;
+	// Lid state from EC RAM. Our own EC transaction can raise the EC's SCI: clear that GPE status again unless a
+	// real event is pending (SCI_EVT), so polling never looks like an EC wake.
+	const int la = lidAddr;
+	const uint8_t lbit = (uint8_t)(1U << lidBit);
+	const bool linv = lidInvert, lidOn = la >= 0 && platformReady && tpms;
+	bool lidWasClosed = false;
+	uint64_t lidNext = 0;
+	auto lidPoll = [&]() -> int {   // 1 open, 0 closed, -1 error
+		const int v = ecRead((uint8_t)la);
+		if (ecGpe >= 0 && (unsigned)ecGpe < nb * 8 && !(inb(ecCmd) & 0x20)) {
+			const unsigned i = (unsigned)ecGpe >> 3;
+			const uint8_t bit = (uint8_t)(1U << (ecGpe & 7));
+			outb(port(gpe0Sts, i), bit);
+			snap[i] = (uint8_t)(inb(port(gpe0Sts, i)) & ~bit);
+		}
+		if (v < 0) { lidErrors++; return -1; }
+		lidLast = v;
+		return ((v & lbit) != 0) != linv ? 1 : 0;
+	};
+	lidEntry = lidLast = -1;
+	if (lidOn) {
+		const int o = lidPoll();
+		lidEntry = lidLast;
+		lidWasClosed = o == 0;
+		lidNext = rdtsc() + tpms * 500;
+	}
 	while (!reason) {
 		const uint16_t pm1 = inw(pm1Sts);
 		if (pm1 & Pm1PwrBtn) reason = 1;
@@ -555,6 +599,12 @@ void s0ixWait(void *) {
 				break;
 			}
 			snap[i] = g;
+		}
+		if (!reason && lidOn && rdtsc() >= lidNext) {
+			lidNext = rdtsc() + tpms * 500;
+			const int o = lidPoll();
+			if (o == 0) lidWasClosed = true;
+			else if (o == 1 && lidWasClosed) reason = 4;
 		}
 		if (mw) {
 			if (reason) break;
@@ -760,6 +810,32 @@ int listHandler(struct sysctl_oid *oidp, void *, int arg2, struct sysctl_req *re
 	return parseList(buf, map, text, sizeof(ecIgnoreText)) ? 0 : EINVAL;
 }
 
+// "83.0" = EC RAM byte 0x83, bit 0, 1 = open; "~83.0" = 0 = open; "" or "-" = off.
+bool parseLid(const char *s) {
+	bool inv = false;
+	while (*s == ' ') s++;
+	if (!*s || (s[0] == '-' && !s[1])) { lidAddr = -1; strlcpy(lidText, "-", sizeof(lidText)); return true; }
+	if (*s == '~') { inv = true; s++; }
+	unsigned a = 0, digits = 0;
+	for (; *s && *s != '.'; s++, digits++) {
+		const char c = *s;
+		const int h = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+		if (h < 0 || digits >= 2) return false;
+		a = a * 16 + (unsigned)h;
+	}
+	if (!digits || *s != '.' || s[1] < '0' || s[1] > '7' || (s[2] && s[2] != '\n')) return false;
+	lidAddr = (int)a; lidBit = s[1] - '0'; lidInvert = inv;
+	snprintf(lidText, sizeof(lidText), "%s%02x.%d", inv ? "~" : "", a, lidBit);
+	return true;
+}
+int lidHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	char buf[16];
+	strlcpy(buf, lidText, sizeof(buf));
+	const int error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error || !req->newptr) return error;
+	return parseLid(buf) ? 0 : EINVAL;
+}
+
 char statText[1024];
 int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	char en[2 * MaxGpeBytes + 1];
@@ -778,13 +854,13 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s",
+		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
-		wakeGpeText[0] ? wakeGpeText : "-", s0, s1);
+		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors);
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -801,6 +877,7 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0,
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, gtreset, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, gtHandler, "I", "1 = reset the Intel GT on wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_ignore, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, listHandler, "A", "EC events that do not wake (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_wake, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 1, listHandler, "A", "only these EC events wake (hex)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, lid_ec, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, lidHandler, "A", "lid state in EC RAM: byte.bit (hex), ~ = inverted");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, wake_gpe, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 2, listHandler, "A", "extra GPEs that wake (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, stat, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, statHandler, "A", "status");
 
@@ -809,6 +886,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	if (PE_parse_boot_argn("s0ixecign", arg, sizeof(arg))) parseList(arg, ecIgnore, ecIgnoreText, sizeof(ecIgnoreText));
 	if (PE_parse_boot_argn("s0ixecwake", arg, sizeof(arg))) parseList(arg, ecWake, ecWakeText, sizeof(ecWakeText));
 	if (PE_parse_boot_argn("s0ixwakegpe", arg, sizeof(arg))) parseList(arg, wakeGpe, wakeGpeText, sizeof(wakeGpeText));
+	if (PE_parse_boot_argn("s0ixlidec", arg, sizeof(arg))) parseLid(arg);
 
 	const mach_vm_address_t fn = patcher.solveSymbol(KernelPatcher::KernelID, "_acpi_sleep_kernel");
 	patcher.clearError();
@@ -846,6 +924,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_ignore);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_wake);
 	sysctl_register_oid(&sysctl__debug_s0ix_wake_gpe);
+	sysctl_register_oid(&sysctl__debug_s0ix_lid_ec);
 	sysctl_register_oid(&sysctl__debug_s0ix_stat);
 	SYSLOG("s0ix", "acpi_sleep_kernel route %d, requestUserActive %s", route, requestUserActive ? "found" : "missing");
 }
