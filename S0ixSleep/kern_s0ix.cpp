@@ -159,7 +159,29 @@ uint32_t replayMap[8];
 volatile bool replayPending = false;
 thread_call_t replayCall = nullptr;
 uint32_t replayedLast = 0, replayedTotal = 0;
-S0ixSleepShared shared {S0ixSleepSharedVersion, 0, 0, 0, 0};
+// Wait hooks added by other kexts through shared.addHook.
+constexpr unsigned HookSlots = 4;
+struct Hook { volatile S0ixSleepHook fn; void *volatile ctx; };
+Hook hooks[HookSlots];
+volatile uint32_t hookCount = 0;
+uint32_t hookCalls = 0;
+bool addHook(S0ixSleepHook fn, void *ctx) {
+	if (!fn) return false;
+	for (unsigned i = 0; i < HookSlots; i++) {
+		S0ixSleepHook expected = nullptr;
+		if (__atomic_compare_exchange_n(&hooks[i].fn, &expected, fn, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			hooks[i].ctx = ctx;
+			__atomic_add_fetch(&hookCount, 1, __ATOMIC_ACQ_REL);
+			return true;
+		}
+	}
+	return false;
+}
+void runHooks(uint32_t phase, uint32_t reason) {
+	for (unsigned i = 0; i < HookSlots; i++)
+		if (S0ixSleepHook fn = __atomic_load_n(&hooks[i].fn, __ATOMIC_ACQUIRE)) { fn(hooks[i].ctx, phase, reason); hookCalls++; }
+}
+S0ixSleepShared shared {S0ixSleepSharedVersion, 0, 0, 0, 0, HookSlots, addHook};
 
 bool mapHas(const uint32_t *m, uint32_t q) { return q < 256 && (m[q >> 5] >> (q & 31)) & 1; }
 bool mapAny(const uint32_t *m) { for (unsigned i = 0; i < 8; i++) if (m[i]) return true; return false; }
@@ -465,6 +487,7 @@ void leaveMwait(const ApicSave &s) {
 
 // ─── the wait ───────────────────────────────────────────────────────────────────────────────────
 void s0ixWait(void *) {
+	runHooks(S0ixHookEnter, 0);
 	uint8_t snap[MaxGpeBytes];
 	const unsigned nb = gpe0Bytes;
 	// Only GPEs the OS armed for wake (GPE0 enable) may end the wait.
@@ -556,7 +579,8 @@ void s0ixWait(void *) {
 		} else lastPkgMw = lastCoreMw = 0;
 	}
 	if (reason == 1) outw(pm1Sts, Pm1PwrBtn);
-	if (gtReset && gtMmio) resetGt();
+	if (gtReset && gtMmio) resetGt();   // legacy option; graphics kexts should do this from a hook
+	runHooks(S0ixHookExit, reason);
 	lastReason = reason;
 	lastLoops = loops;
 	shared.reason = reason;
@@ -728,12 +752,12 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	snprintf(statText, sizeof(statText),
 		"route=%d enable=%d platform=%d lps0=%d pm1=0x%x gpe0=0x%x/%u ec=0x%x/0x%x ecgpe=%d kbc=%d intel=%d hwp_cap=%d waitpkg=%d tsc_ms=%llu"
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
-		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x"
+		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
 		" pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
-		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult,
+		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal);
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
