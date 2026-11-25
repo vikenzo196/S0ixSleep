@@ -129,6 +129,7 @@ int periodMs = 50;      // wait 2: LAPIC timer period
 int safetySec = 0;      // wake by itself after N seconds (0 = never)
 int gtReset = 0;        // 1 = reset the Intel GT before returning (Gen12+, see README)
 int ecReplay = 1;       // 1 = run the _Qxx methods of the EC events consumed during the sleep after wake
+int pmcDiag = 0;        // 1 = snapshot Intel PCH PMC registers (LTR, power gating, SLP_S0) around each sleep
 uint32_t ecIgnore[8], ecWake[8];
 char ecIgnoreText[200], ecWakeText[200];
 
@@ -251,6 +252,7 @@ void mapGt() {
 }
 
 void probeResidency();
+void preparePmc();
 
 bool prepare() {
 	if (!platformReady) platformReady = readPlatform();
@@ -277,6 +279,7 @@ bool prepare() {
 	}
 	if (gtReset) mapGt();
 	probeResidency();
+	preparePmc();
 	return true;
 }
 
@@ -296,6 +299,37 @@ void resetGt() {
 	while ((*gdrst & 1U) && n < 2000) { spin(2000); n++; }
 	gtResult = (*gdrst & 1U) ? 0x80000000U | n : n + 1;
 	for (auto &f : fw) *reg(f[0]) = 0x00010000U;
+}
+
+// ─── PMC diagnostic (read only, opt-in) ─────────────────────────────────────────────────────────
+// Intel PCH PMC registers (Cannon Point to Alder Point layout, as Linux intel_pmc_core reads them) at the
+// PWRMBASE the firmware stores in \PWRM: SLP_S0 debug (0x10B4), power gating PPFEAR (0x1590), low power
+// mode status (0x1700), SLP_S0 residency (0x193C), LTR ignore (0x1B0C) and the per-IP / aggregated LTR
+// values (0x1B50). Snapshots at the start and the end of the wait; the sysctl also reads them live.
+struct PmcRange { uint16_t off, count; };
+constexpr PmcRange PmcRanges[] = {{0x10B4, 3}, {0x1590, 2}, {0x1700, 48}, {0x193C, 1}, {0x1B0C, 1}, {0x1B50, 48}};
+constexpr unsigned PmcDwords = 3 + 2 + 48 + 1 + 1 + 48;
+IOMemoryMap *pmcMap = nullptr;
+volatile uint32_t *pmcMmio = nullptr;
+uint64_t pmcBase = 0;
+uint32_t pmcStart[PmcDwords], pmcEnd[PmcDwords];
+bool pmcHave = false;
+
+void pmcSnapshot(uint32_t *out) {
+	unsigned k = 0;
+	for (const auto &r : PmcRanges)
+		for (unsigned i = 0; i < r.count; i++) out[k++] = pmcMmio[(r.off + 4 * i) / 4];
+}
+
+void preparePmc() {
+	if (!pmcDiag || pmcMmio || intel != 1 || !ecDevice) return;
+	UInt32 base = 0;
+	if (ecDevice->evaluateInteger("\\PWRM", &base) != kIOReturnSuccess || !base || (base & 0xFFF)) return;
+	if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(base, 0x2000, kIODirectionInOut)) {
+		pmcMap = md->map(kIOMapInhibitCache);
+		md->release();
+	}
+	if (pmcMap) { pmcMmio = reinterpret_cast<volatile uint32_t *>(pmcMap->getVirtualAddress()); pmcBase = base; }
 }
 
 // ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
@@ -441,6 +475,8 @@ void s0ixWait(void *) {
 	const uint32_t rok = resOk;
 	uint64_t r0[7] = {};
 	for (unsigned i = 0; i < 7; i++) if (rok & (1U << i)) r0[i] = rdmsr(ResMsr[i]);
+	const bool pmc = pmcDiag && pmcMmio;
+	if (pmc) pmcSnapshot(pmcStart);
 	ApicSave as {};
 	const bool mw = wait == 2 && mwaitReady && tpms && enterMwait(as);
 	const uint64_t mwPeriod = tpms * (uint64_t)periodMs;
@@ -486,6 +522,7 @@ void s0ixWait(void *) {
 		leaveMwait(as);
 	} else mwaitIrqs = 0;
 	lastMwait = mw ? 1 : (wait == 2 ? 2 : 0);
+	if (pmc) { pmcSnapshot(pmcEnd); pmcHave = true; }
 	{
 		const uint64_t dt = rdtsc() - t0;
 		for (unsigned i = 0; i < 7; i++) resPm[i] = (rok & (1U << i)) && dt ? (uint32_t)((rdmsr(ResMsr[i]) - r0[i]) * 1000ULL / dt) : 0;
@@ -596,6 +633,30 @@ int waitHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 }
 int periodHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &periodMs, 5, 1000, r); }
 int replayHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &ecReplay, 0, 1, r); }
+int pmcDiagHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
+	const int error = intHandler(o, &pmcDiag, 0, 1, r);
+	if (!error && r->newptr && pmcDiag && platformReady) preparePmc();
+	return error;
+}
+// "base=0x... ranges=off:count,... live=<hex> start=<hex> end=<hex>" (hex dwords, the ranges concatenated)
+char pmcText[3 * PmcDwords * 9 + 160];
+int pmcHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	size_t u = 0;
+	auto put = [&](const char *label, const uint32_t *v) {
+		u += (size_t)snprintf(pmcText + u, sizeof(pmcText) - u, " %s=", label);
+		for (unsigned i = 0; i < PmcDwords && u + 10 < sizeof(pmcText); i++)
+			u += (size_t)snprintf(pmcText + u, sizeof(pmcText) - u, i ? ",%08x" : "%08x", v[i]);
+	};
+	u = (size_t)snprintf(pmcText, sizeof(pmcText), "base=0x%llx ranges=", pmcBase);
+	for (const auto &r : PmcRanges) u += (size_t)snprintf(pmcText + u, sizeof(pmcText) - u, "%x:%u,", r.off, r.count);
+	if (pmcMmio) {
+		uint32_t live[PmcDwords];
+		pmcSnapshot(live);
+		put("live", live);
+		if (pmcHave) { put("start", pmcStart); put("end", pmcEnd); }
+	}
+	return sysctl_handle_string(oidp, pmcText, sizeof(pmcText), req);
+}
 int safetyHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &safetySec, 0, 86400, r); }
 int gtHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
 	const int error = intHandler(o, &gtReset, 0, 1, r);
@@ -669,6 +730,8 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, enable, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0,
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, wait, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, waitHandler, "I", "0 spin, 1 TPAUSE, 2 MWAIT + APIC timer");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, period, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, periodHandler, "I", "wait 2: APIC timer period (ms)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_replay, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, replayHandler, "I", "1 = run consumed EC events' _Qxx after wake");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pmcDiagHandler, "I", "1 = PCH PMC snapshots around sleep");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC registers (live/start/end)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, safetyHandler, "I", "wake after N s (0 never)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, gtreset, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, gtHandler, "I", "1 = reset the Intel GT on wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_ignore, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, listHandler, "A", "EC events that do not wake (hex)");
@@ -709,6 +772,8 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_wait);
 	sysctl_register_oid(&sysctl__debug_s0ix_period);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_replay);
+	sysctl_register_oid(&sysctl__debug_s0ix_pmc_diag);
+	sysctl_register_oid(&sysctl__debug_s0ix_pmc);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_gtreset);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_ignore);
