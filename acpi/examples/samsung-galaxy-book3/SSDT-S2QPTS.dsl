@@ -16,17 +16,29 @@
  * Only the EC flags are replayed, not the rest of those _DSM functions (GUAM,
  * dGPU, XHCI, GPIO hooks, display-off wait loop).
  *
+ * Lid (v3): the firmware's QWAK assumes that a wake from S3 means the lid was
+ * opened: it sets LIDS (what _LID returns) to open and notifies LID0. An s2idle
+ * wake can also be a timer (dark) wake with the lid still closed: macOS then
+ * turns the display on and believes the lid is open. On macOS S3 the firmware
+ * QWAK sees LIDS already "open" (no change, no notify), LIDS is put back, and
+ * the lid state the EC really reports (LSTE) is published only if it changed.
+ *
  * Requires in DSDT.aml the method definitions \_SB.QPTS -> \_SB.XPTS
  * (14 40 07 "QPTS" 01 -> 14 40 07 "XPTS" 01) and \_SB.QWAK -> \_SB.XWAK
  * (14 43 1B "QWAK" 01 -> 14 43 1B "XWAK" 01). S4/S5 keep the original path.
  */
-DefinitionBlock ("", "SSDT", 2, "VIK", "S2QPTS", 0x00002000)
+DefinitionBlock ("", "SSDT", 2, "VIK", "S2QPTS", 0x00003000)
 {
     External (_SB_.XPTS, MethodObj)
     External (_SB_.XWAK, MethodObj)
     External (_SB_.PC00.LPCB.H_EC.CSMF, FieldUnitObj)
     External (_SB_.PC00.LPCB.H_EC.MSST, FieldUnitObj)
+    External (_SB_.PC00.LPCB.H_EC.LSTE, FieldUnitObj)
+    External (_SB_.PC00.GFX0.CLID, FieldUnitObj)
+    External (_SB_.LID0, DeviceObj)
     External (ECON, FieldUnitObj)
+    External (LIDS, FieldUnitObj)
+    External (IGDS, FieldUnitObj)
 
     Scope (_SB)
     {
@@ -63,6 +75,34 @@ DefinitionBlock ("", "SSDT", 2, "VIK", "S2QPTS", 0x00002000)
                         \_SB.PC00.LPCB.H_EC.MSST = Zero
                         \_SB.PC00.LPCB.H_EC.CSMF = Zero
                     }
+
+                    Local1 = LIDS
+                    LIDS = One
+                    XWAK (Arg0)
+                    LIDS = Local1
+                    If (ECON)
+                    {
+                        Local2 = \_SB.PC00.LPCB.H_EC.LSTE
+                        If ((Local2 != LIDS))
+                        {
+                            LIDS = Local2
+                            If (IGDS)
+                            {
+                                If ((LIDS == Zero))
+                                {
+                                    \_SB.PC00.GFX0.CLID = 0x80000000
+                                }
+                                Else
+                                {
+                                    \_SB.PC00.GFX0.CLID = 0x80000003
+                                }
+                            }
+
+                            Notify (\_SB.LID0, 0x80) // Status Change
+                        }
+                    }
+
+                    Return (Zero)
                 }
             }
 

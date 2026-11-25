@@ -39,17 +39,23 @@ After a wake caused by the user (key, lid, power button), S0ixSleep asks the pow
 
 **This is not real S0ix.** macOS has no driver for the Intel PMC, so the package does not reach the deep
 S0ix states that Windows uses. Devices are powered down by their macOS drivers and the CPU waits at its
-lowest level, but the machine draws more than in Windows Modern Standby. It is meant for closing the lid
-and moving around, not for leaving a laptop asleep in a bag for days.
+lowest level, but the machine draws more than in Windows Modern Standby: on the tested laptop about 4.9 W, so
+a full battery lasts about half a day asleep. It is meant for closing the lid and moving around, or a night
+on a charged battery, not for leaving a laptop asleep in a bag for days.
 
 ## Results (Galaxy Book3 Ultra)
 
 | | |
 |---|---|
 | Wake | lid open, any key, power button; display back in about 2 s |
-| CPU package power while asleep (RAPL) | about 1.85 W (`wait 2`, package in PC3 98% of the time); 2.9 W with `wait 1` |
+| Whole machine while asleep (battery gauge, `tools/sleep-power.sh`) | about 4.9 W (66 Wh battery: about 13 h) |
+| CPU package while asleep (RAPL) | about 1.8 W with `wait 2` (package in PC3 98% of the time); 2.9 W with `wait 1` |
 | Fans, power LED | off (with the SSDT that tells the EC about Modern Standby) |
 | Time to fall asleep | about 17 s, mostly powerd's own dark wake delay |
+
+The package stops at PC3 on this machine because its display engine stays on (see
+[Package idle states](#package-idle-states)); taking the Wi-Fi card down during the sleep made no measurable
+difference, and macOS already turns the NVMe controller off at every sleep.
 
 ## Requirements
 
@@ -84,6 +90,23 @@ and moving around, not for leaving a laptop asleep in a bag for days.
 
 Kill switch: `sudo touch /usr/local/etc/s0ixsleep-off` and reboot. Uninstall: `sudo ./uninstall.sh`.
 
+## Protections (daemon)
+
+macOS cannot see the battery while it sleeps this way (the embedded controller's battery events are not
+handled during the wait), and a wake nobody asked for would leave the laptop running in a closed bag. The
+daemon therefore watches every wake from s0ix sleep (all settings in `s0ixsleep.conf`):
+
+- **Hourly dark wake** (`SAFETY=3600`): the machine wakes in the dark (display off, about 45 s) and goes back
+  to sleep, so the checks below also run during a long sleep.
+- **Battery guard**: on battery, a clean `shutdown` when the charge is at or below `LOW_BATTERY_SLEEP` (10 %)
+  a few seconds after a wake, or `LOW_BATTERY_AWAKE` (4 %) at any time. A drained battery would otherwise
+  end in a hard power loss.
+- **Bag guard** (`BAG_GUARD=60`): after a wake, if nobody touched the keyboard or trackpad and the display is
+  off for 60 s, back to sleep. `/var/run/s0ixsleep-keepawake` (removed at reboot) holds it off for remote work.
+- **EC event replay** (`EC_REPLAY=1`): after a wake, the firmware's `_Qxx` methods of the EC events ignored
+  during the sleep run once, so macOS sees battery and AC changes at once.
+- Optional `SLEEP_IF_DOWN=en0`: network interfaces down while the lid is closed and no display is on.
+
 ## Status and tuning
 
 ```
@@ -97,8 +120,10 @@ sysctl debug.s0ix.stat
 | `sleeps`, `reason` | completed sleeps and last wake reason: 1 power button, 2 RTC, 3 safety timer, `0x100` + GPE number |
 | `ms`, `pkg_mw`, `core_mw` | length of the last sleep, average package and core power during it |
 | `mwait`, `timer_irqs`, `core_c7_ms`, `mwait_fail` | 1 = last sleep used `wait 2`; timer wakes; core C7 time; why `wait 2` was not entered (1 APIC mode changed, 2 IDT) |
-| `ec_q`, `ec_ign` | last embedded controller events read during sleep (newest first), events ignored |
+| `ec_q`, `ec_ign`, `replayed` | last embedded controller events read during sleep (newest first), events ignored, `_Qxx` replayed after the last wake / in total |
 | `userwake` | full wakes requested after a user wake |
+| `hooks` | wait hooks added by other kexts / calls (see [Graphics](#graphics)) |
+| `pc`, `res_ok` | package C-state residency of the last sleep, per mille (PC2,3,6,7,8,9,10) |
 
 ### Spurious wakes: embedded controller events
 
@@ -113,9 +138,9 @@ EC_IGNORE=51,52,53,54     # these events do not wake
 EC_WAKE=50,5e,5f          # only these events wake
 ```
 
-A filtered event is consumed: its `_Qxx` method does not run, so macOS sees a battery or AC change only at
-the next event after wake. The kext reads the event only when no keyboard byte is waiting in the 8042, so
-key presses always wake.
+A filtered event is consumed: its `_Qxx` method cannot run during the wait; with `EC_REPLAY=1` (default) it
+runs once after the next wake. The kext reads the event only when no keyboard byte is waiting in the 8042,
+so key presses always wake.
 
 The settings are also sysctls (`debug.s0ix.ec_ignore`, `debug.s0ix.ec_wake`, `debug.s0ix.safety`,
 `debug.s0ix.wait`, `debug.s0ix.period`, `debug.s0ix.gtreset`) and boot arguments (`s0ixecign=51,52`,
@@ -127,7 +152,10 @@ The settings are also sysctls (`debug.s0ix.ec_ignore`, `debug.s0ix.ec_wake`, `de
 PC8, PC9 and PC10; `core_c7_ms` is the time the waiting core spent in C7. If the package stops at PC2/PC3,
 something outside the CPU cores keeps it awake. On the tested machine it is the display engine: its pipe
 and eDP link stay on during sleep, because the graphics driver cannot use panel self refresh or the
-display's DC5/DC6 states.
+display's DC5/DC6 states. With `sudo sysctl debug.s0ix.pmc_diag=1` S0ixSleep also snapshots the PCH power
+management controller around each sleep (latency tolerance of every PCH device and of the whole platform,
+power-gated blocks, SLP_S0 conditions); `python3 tools/pmc_decode.py` decodes `sysctl debug.s0ix.pmc`
+(Intel 300 to 700 series PCH layout).
 
 ### Graphics
 
@@ -135,10 +163,22 @@ After this kind of sleep the GPU kept its power and its state, while macOS graph
 cold GPU of an S3 resume. On the tested machine (Iris Xe with a patched framebuffer) the graphics kext
 needed changes to wake cleanly. Things to try if the display does not come back:
 
-- `GT_RESET=1` (Intel Gen12, Tiger Lake and newer): resets the render engine before returning, like a
-  power cycle would.
-- Graphics kexts can detect S0ixSleep: it publishes the `S0ixSleep` resource with a pointer to a small
-  shared structure (sleep counter, "sleeping" flag), see `S0ixSleep/kern_s0ix.hpp`.
+- Graphics kexts can follow S0ixSleep: it publishes the `S0ixSleep` resource (an `OSData` holding the address
+  of a small shared structure: enabled, "sleeping" from `kIOMessageSystemWillSleep` to
+  `kIOMessageSystemHasPoweredOn`, sleep counter, last wake reason), see `S0ixSleep/kern_s0ix.hpp`.
+- From version 2 the structure has `addHook()`: a kext adds a function that S0ixSleep calls inside the sleep,
+  on the waiting CPU with interrupts off, once when entering the wait and once when leaving it. Register
+  writes only (no locks, allocations or IOKit calls). The WhateverXe fork uses it to reset the GT (render
+  engine) on the way out, as a power cycle would have.
+- `GT_RESET=1` (Intel Gen12, Tiger Lake and newer): the same reset done by S0ixSleep itself, for graphics
+  kexts that do not use the hook.
+
+## Measuring
+
+`sudo tools/sleep-power.sh 1800` puts the machine to sleep for 30 minutes (lid open, on battery), wakes it
+with the safety timer and prints the whole-machine sleep power. Battery gauges that move in 1 % steps are
+read at the moment of a step before and after the sleep; the awake part in between is integrated from the
+sampled current (about ±0.25 W for 30 minutes). Compare settings with runs of the same length.
 
 ## Building
 
