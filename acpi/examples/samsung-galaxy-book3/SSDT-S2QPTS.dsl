@@ -23,14 +23,23 @@
  * QWAK sees LIDS already "open" (no change, no notify), LIDS is put back, and
  * the lid state the EC really reports (LSTE) is published only if it changed.
  *
+ * Power on by opening the lid (v4): before a shutdown (_PTS(5)) the firmware's
+ * GPTS hands the SMI handler 0x05 when the Samsung Windows driver is loaded
+ * (\_SB.SCAI.DVLD, set by its SDLS call) and 0x15 otherwise; only after the
+ * former does opening the lid power the laptop on. On macOS, for S5 only, set
+ * DVLD before calling the firmware's GPTS (renamed XGPT).
+ *
  * Requires in DSDT.aml the method definitions \_SB.QPTS -> \_SB.XPTS
  * (14 40 07 "QPTS" 01 -> 14 40 07 "XPTS" 01) and \_SB.QWAK -> \_SB.XWAK
- * (14 43 1B "QWAK" 01 -> 14 43 1B "XWAK" 01). S4/S5 keep the original path.
+ * (14 43 1B "QWAK" 01 -> 14 43 1B "XWAK" 01), and \_SB.GPTS -> \_SB.XGPT
+ * (v4). S4/S5 keep the original path, apart from DVLD before S5.
  */
-DefinitionBlock ("", "SSDT", 2, "VIK", "S2QPTS", 0x00003000)
+DefinitionBlock ("", "SSDT", 2, "VIK", "S2QPTS", 0x00004000)
 {
     External (_SB_.XPTS, MethodObj)
     External (_SB_.XWAK, MethodObj)
+    External (_SB_.XGPT, MethodObj)
+    External (_SB_.SCAI.DVLD, IntObj)
     External (_SB_.PC00.LPCB.H_EC.CSMF, FieldUnitObj)
     External (_SB_.PC00.LPCB.H_EC.MSST, FieldUnitObj)
     External (_SB_.PC00.LPCB.H_EC.LSTE, FieldUnitObj)
@@ -42,6 +51,19 @@ DefinitionBlock ("", "SSDT", 2, "VIK", "S2QPTS", 0x00003000)
 
     Scope (_SB)
     {
+        Method (GPTS, 1, NotSerialized)
+        {
+            If (_OSI ("Darwin"))
+            {
+                If ((Arg0 == 0x05))
+                {
+                    \_SB.SCAI.DVLD = One
+                }
+            }
+
+            XGPT (Arg0)
+        }
+
         Method (QPTS, 1, NotSerialized)
         {
             If (_OSI ("Darwin"))
