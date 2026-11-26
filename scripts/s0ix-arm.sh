@@ -68,11 +68,45 @@ battery() {
   printf '%s %s\n' "$(printf '%s' "$b" | grep -oE '[0-9]+%' | head -1 | tr -d '%')" \
     "$(printf '%s' "$b" | grep -q "'Battery Power'" && echo BAT || echo AC)"
 }
+# Raw battery data, for the log: remaining/full mAh, mV, mA, time of macOS's last battery update.
+battery_raw() {
+  local c m v a u
+  read -r c m v a u <<< "$(ioreg -rn AppleSmartBattery 2>/dev/null | awk '
+    $1 == "\"AppleRawCurrentCapacity\"" {c = $3} $1 == "\"AppleRawMaxCapacity\"" {m = $3}
+    $1 == "\"Voltage\"" {v = $3} $1 == "\"InstantAmperage\"" {a = $3} $1 == "\"UpdateTime\"" {u = $3}
+    END {print c, m, v, a, u}')"
+  printf '%s/%s mAh, %s mV, %s mA, updated %ss ago' "$c" "$m" "$v" "$((a))" "$(( $(date +%s) - ${u:-0} ))"
+}
+# The charge read right after a wake or at boot is sometimes wrong for a while (the EC reports a wrong remaining
+# capacity, and macOS rereads the battery only once a minute). A low reading must therefore be confirmed:
+# awake, by a second reading 70 s later (after macOS's next update); after a sleep, by the next dark wake, which
+# is brought forward to 10 minutes.
+low_suspect=0
 check_battery() {   # $1 threshold, $2 label
   local pct src; read -r pct src <<< "$(battery)"
-  if [ "$src" = BAT ] && [ -n "$pct" ] && [ "$pct" -le "$1" ]; then
-    log "battery $pct% <= $1% ($2): clean shutdown"
+  if [ "$src" != BAT ] || [ -z "$pct" ] || [ "$pct" -gt "$1" ]; then
+    if [ "$low_suspect" = 1 ]; then
+      low_suspect=0; sysctl -w debug.s0ix.safety="$SAFETY" >/dev/null
+      if [ "$src" = BAT ]; then log "battery now $pct% ($(battery_raw)): the low reading was wrong, dark wake back to every $SAFETY s"
+      else log "on AC power ($pct%): low-battery check cancelled, dark wake back to every $SAFETY s"; fi
+    fi
+    return
+  fi
+  if [ "$2" = awake ]; then
+    log "battery $pct% <= $1% (awake, $(battery_raw)): reading again in 70 s"
+    sleep 70
+    read -r pct src <<< "$(battery)"
+    if [ "$src" = BAT ] && [ -n "$pct" ] && [ "$pct" -le "$1" ]; then
+      log "battery $pct% <= $1% again ($(battery_raw)): clean shutdown"
+      shutdown -h now; idle
+    fi
+    log "battery now $pct% ($src, $(battery_raw)): the low reading was wrong, no shutdown"
+  elif [ "$low_suspect" = 1 ]; then
+    log "battery $pct% <= $1% ($2) again ($(battery_raw)): clean shutdown"
     shutdown -h now; idle
+  else
+    low_suspect=1; sysctl -w debug.s0ix.safety=600 >/dev/null
+    log "battery $pct% <= $1% ($2, $(battery_raw)): to be confirmed at the next dark wake, in 10 min"
   fi
 }
 hid_idle() { ioreg -c IOHIDSystem -d 4 -r -k HIDIdleTime 2>/dev/null | awk '/HIDIdleTime/ {print int($NF / 1000000000); exit}'; }
@@ -92,6 +126,7 @@ if_set() {   # $1 interface, $2 up|down
 }
 net_down=0
 
+log "battery at start: $(battery | cut -d" " -f1)% ($(battery_raw))"
 last=$(field sleeps); woke=0; checked=1; guard=0; n=0
 while :; do
   sleep 2 & wait $!
@@ -110,7 +145,7 @@ while :; do
   s=$(field sleeps)
   if [ -n "$s" ] && [ "$s" != "$last" ]; then
     last=$s; woke=$(date +%s); checked=0; guard=1
-    log "wake $s: reason $(field reason), $(field ms) ms, package $(field pkg_mw) mW, EC $(field ec_q), replayed $(field replayed)"
+    log "wake $s: reason $(field reason), $(field ms) ms, package $(field pkg_mw) mW, EC $(field ec_q), replayed $(field replayed); battery $(battery | cut -d" " -f1)% ($(battery_raw))"
   fi
   [ "$woke" = 0 ] && continue
   since=$(( $(date +%s) - woke ))
