@@ -60,7 +60,7 @@ esp_of_opencore() {
 stat_field() { printf '%s\n' "$STAT" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 
 cmd_check() {
-	local v major cpu sub esp oc ocver lilu s0ix pep lid ec bat gpu gfx sd hib route enable state
+	local v major cpu sub esp oc ocver lilu s0ix pep lid ec bat gpu gfx sd hib route enable state ign lidec wg n ms pkg lbs lba
 
 	FAILS=0; WARNS=0
 	printf '%sS0ixSleep check%s: looks at this Mac, changes nothing.\n' "$B" "$N"
@@ -154,6 +154,31 @@ cmd_check() {
 		elif [ "$enable" = 1 ]; then warn "S0ixSleep enabled but sleep is disabled (SleepDisabled=$sd)"
 		elif [ "$sd" = 0 ]; then fail "sleep is allowed but S0ixSleep is not enabled: the firmware's S3 would be used"
 		else info "S0ixSleep not enabled, sleep disabled: safe"; fi
+		ign=$(sysctl -n debug.s0ix.ec_ignore 2>/dev/null)
+		if [ -n "$ign" ]; then ok "EC events that do not wake it: $ign"
+		elif [ -n "$ec" ]; then
+			info "EC_IGNORE is empty: every EC event (battery, AC, temperature...) wakes the laptop"
+			more "If it wakes by itself, see $REPO#spurious-wakes-embedded-controller-events"
+		fi
+		if lidec=$(sysctl -n debug.s0ix.lid_ec 2>/dev/null); then
+			if [ "$lidec" != - ]; then ok "lid state read from the EC during the sleep (LID_EC=$lidec)"
+			elif [ -n "$lid" ]; then
+				info "LID_EC is not set: fine as long as opening the lid always wakes the laptop"
+				more "If it sometimes does not, see $REPO#lid-that-does-not-always-wake-the-laptop"
+			fi
+			wg=$(sysctl -n debug.s0ix.wake_gpe 2>/dev/null)
+			[ -n "$wg" ] && [ "$wg" != - ] && info "extra wake GPEs: $wg"
+		elif [ -n "$lid" ]; then
+			info "this S0ixSleep has no LID_EC (lid state read from the EC): it came with 0.1.2"
+		fi
+		lbs=$(conf_get LOW_BATTERY_SLEEP); lba=$(conf_get LOW_BATTERY_AWAKE)
+		if [ "$bat" -gt 0 ]; then
+			info "battery guard: clean shutdown at ${lbs:-10}% after a sleep, ${lba:-4}% awake (0 = off), each low reading confirmed"
+		fi
+		n=$(stat_field sleeps); ms=$(stat_field ms); pkg=$(stat_field pkg_mw)
+		if [ "${n:-0}" -gt 0 ]; then
+			info "last sleep: $((${ms:-0} / 1000)) s, woken by $(describe_reason "$(stat_field reason)" "$(stat_field ecgpe)")$([ "${pkg:-0}" -gt 0 ] && awk -v m="$pkg" 'BEGIN { printf ", CPU package %.2f W", m / 1000 }') ($n since boot)"
+		fi
 	else
 		info "S0ixSleep is not installed"
 		if [ "$sd" = 0 ] && [ -n "$pep" ]; then
@@ -569,6 +594,10 @@ cmd_test() {
 				more "Run the test again: other events may show up one at a time."
 			fi
 		fi
+	elif [ $((reason)) -eq 1 ]; then
+		echo
+		more "If you had opened the lid and it did not wake the laptop, the EC may not have sent its lid event:"
+		more "see LID_EC in $CONF."
 	elif [ $((reason)) -eq 3 ]; then
 		echo
 		more "Now try the lid: close it, wait 15 s, open it. The laptop should wake in a few seconds."
