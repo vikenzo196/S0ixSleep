@@ -438,11 +438,12 @@ void preparePci() {
 		if (pcie) d->extendedFindPCICapability(static_cast<UInt32>(-0x1E), &l1);   // L1 PM Substates (extended ID 0x1E, negated)
 		f.pm = pm; f.pcie = pcie; f.l1ss = (uint16_t)l1;
 		const uint64_t phys = pciEcam + ((uint64_t)f.bdf << 12);
-		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(phys, 4096, kIODirectionInOut, kernel_task);
+		// ECAM is physical: map it like the PMC (withPhysicalAddress, uncached).
+		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(phys, 4096, kIODirectionInOut);
 		if (!md) continue;
-		IOMemoryMap *m = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
+		IOMemoryMap *m = md->map(kIOMapInhibitCache);
 		md->release();
-		if (!m) continue;
+		if (!m || !m->getVirtualAddress()) { if (m) m->release(); continue; }
 		f.map = m;
 		f.cfg = reinterpret_cast<volatile uint8_t *>(m->getVirtualAddress());
 		if (rd32(f.cfg, 0) != d->configRead32(0)) { m->release(); continue; }   // not this function's ECAM page
