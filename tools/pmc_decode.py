@@ -68,15 +68,18 @@ def main():
         for i, n in enumerate(names):
             vals = [(snaps[k].get(off, 0) >> i) & 1 for k in keys]
             print('  %-20s %s' % (n, ' '.join(str(v) for v in vals)))
-    pf = {k: snaps[k].get(0x1590, 0) | (snaps[k].get(0x1594, 0) << 32) for k in keys}
-    print('\nPPFEAR (1 = IP power gated / off)')
+    pfo = 0x1D90 if 0x1D90 in snaps[keys[0]] else 0x1590   # 0x1590 only in snapshots of S0ixSleep 0.1.0-0.1.3
+    pf = {k: snaps[k].get(pfo, 0) | (snaps[k].get(pfo + 4, 0) << 32) for k in keys}
+    print('\nPPFEAR at 0x%X (1 = IP power gated / off)%s' % (pfo, '' if pfo == 0x1D90 else ': OLD OFFSET, not valid on Cannon Point and later'))
     for i, n in enumerate(PFEAR):
         vals = [(pf[k] >> i) & 1 for k in keys]
         if any(vals) or True:
             print('  %-12s %s' % (n, ' '.join(str(v) for v in vals)))
     if 'start' in snaps and 'end' in snaps:
-        d = (snaps['end'][0x193C] - snaps['start'][0x193C]) & 0xFFFFFFFF
-        print('\nSLP_S0 residency during the last sleep: %d counts (~%.1f s at 122 us/count)' % (d, d * 122e-6))
+        for off, what in ((0x1098, 'Alder Lake'), (0x193C, 'Cannon Point to Tiger Lake')):
+            if off in snaps['start']:
+                d = (snaps['end'][off] - snaps['start'][off]) & 0xFFFFFFFF
+                print('\nSLP_S0 residency during the last sleep (0x%X, %s): %d counts (~%.1f s at 122 us/count)' % (off, what, d, d * 122e-6))
     print('\nLPM registers 0x1700-0x17BC:')
     for k in keys:
         print('  %-5s %s' % (k, ' '.join('%08x' % snaps[k].get(0x1700 + 4 * i, 0) for i in range(48))))

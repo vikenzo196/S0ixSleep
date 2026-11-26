@@ -347,12 +347,14 @@ void resetGt() {
 
 // ─── PMC diagnostic (read only, opt-in) ─────────────────────────────────────────────────────────
 // Intel PCH PMC registers (Cannon Point to Alder Point layout, as Linux intel_pmc_core reads them) at the
-// PWRMBASE the firmware stores in \PWRM: SLP_S0 debug (0x10B4), power gating PPFEAR (0x1590), low power
-// mode status (0x1700), SLP_S0 residency (0x193C), LTR ignore (0x1B0C) and the per-IP / aggregated LTR
-// values (0x1B50). Snapshots at the start and the end of the wait; the sysctl also reads them live.
+// PWRMBASE the firmware stores in \PWRM: SLP_S0 residency on Alder Lake (0x1098), SLP_S0 debug (0x10B4),
+// low power mode registers (0x1700, Alder Lake status 0x170C / live 0x1764), SLP_S0 residency on Cannon Point
+// to Tiger Lake (0x193C), LTR ignore (0x1B0C), per-IP / aggregated LTR values (0x1B50) and the IP power gating
+// status PPFEAR (0x1D90, as in Linux for Cannon Point and later). Snapshots at the start and the end of the
+// wait; the sysctl also reads them live.
 struct PmcRange { uint16_t off, count; };
-constexpr PmcRange PmcRanges[] = {{0x10B4, 3}, {0x1590, 2}, {0x1700, 48}, {0x193C, 1}, {0x1B0C, 1}, {0x1B50, 48}};
-constexpr unsigned PmcDwords = 3 + 2 + 48 + 1 + 1 + 48;
+constexpr PmcRange PmcRanges[] = {{0x1098, 1}, {0x10B4, 3}, {0x1700, 48}, {0x193C, 1}, {0x1B0C, 1}, {0x1B50, 48}, {0x1D90, 3}};
+constexpr unsigned PmcDwords = 1 + 3 + 48 + 1 + 1 + 48 + 3;
 IOMemoryMap *pmcMap = nullptr;
 volatile uint32_t *pmcMmio = nullptr;
 uint64_t pmcBase = 0;
