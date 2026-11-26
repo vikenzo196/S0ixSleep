@@ -130,6 +130,7 @@ int safetySec = 0;      // wake by itself after N seconds (0 = never)
 int gtReset = 0;        // 1 = reset the Intel GT before returning (Gen12+, see README)
 int ecReplay = 1;       // 1 = run the _Qxx methods of the EC events consumed during the sleep after wake
 int pmcDiag = 0;        // 1 = snapshot Intel PCH PMC registers (LTR, power gating, SLP_S0) around each sleep
+int pciDiag = 0;        // 1 = snapshot the power and link state of every PCI function inside each sleep
 uint32_t ecIgnore[8], ecWake[8];
 char ecIgnoreText[200], ecWakeText[200];
 // Extra GPEs whose status may end the wait although the OS did not arm them (for example a lid GPIO that has
@@ -394,6 +395,62 @@ void preparePmc() {
 	if (mapPmc(0xFE000000ULL)) pmcSource = 2;
 }
 
+// ─── PCI diagnostics: what stays powered inside the sleep ────────────────────────────────────────────────────────
+// For every IOPCIDevice: PMCSR (D-state), PCIe Link Control/Status (ASPM, link up), Device Control 2 (LTR enable)
+// and L1 PM Substates Control 1, read through ECAM (acpi-mmcfg-seg0) so the snapshot can be taken inside the wait
+// after every driver and hook has run. Capability offsets and ECAM pages are prepared in thread context.
+constexpr unsigned PciMax = 64;
+struct PciFn { uint16_t bdf, pm, pcie, l1ss; volatile uint8_t *cfg; IOMemoryMap *map; };
+struct PciSnap { uint32_t id, pmcsr, lnk, dc2, l1ss; };
+PciFn pciFns[PciMax];
+PciSnap pciSleep[PciMax];
+unsigned pciCount = 0;
+uint32_t pciSnaps = 0;
+uint64_t pciEcam = 0;
+uint32_t rd32(volatile uint8_t *b, unsigned off) { return *reinterpret_cast<volatile uint32_t *>(b + off); }
+void pciSnapshot(PciSnap *out) {
+	for (unsigned i = 0; i < pciCount; i++) {
+		const PciFn &f = pciFns[i];
+		PciSnap &s = out[i];
+		s.id = rd32(f.cfg, 0);
+		s.pmcsr = f.pm ? rd32(f.cfg, f.pm + 4) & 0xFFFF : 0xFFFFFFFFU;
+		s.lnk = f.pcie ? rd32(f.cfg, f.pcie + 0x10) : 0xFFFFFFFFU;
+		s.dc2 = f.pcie ? rd32(f.cfg, f.pcie + 0x28) & 0xFFFF : 0xFFFFFFFFU;
+		s.l1ss = f.l1ss ? rd32(f.cfg, f.l1ss + 8) : 0xFFFFFFFFU;
+	}
+}
+void preparePci() {
+	if (!pciDiag || pciCount) return;
+	if (OSNumber *n = OSDynamicCast(OSNumber, IOService::getPlatform() ? IOService::getPlatform()->getProperty("acpi-mmcfg-seg0") : nullptr))
+		pciEcam = n->unsigned64BitValue();
+	if (!pciEcam || (pciEcam & 0xFFFFF)) return;
+	OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+	if (!it) return;
+	while (OSObject *o = it->getNextObject()) {
+		IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
+		if (!d || pciCount >= PciMax) continue;
+		PciFn f {};
+		f.bdf = (uint16_t)((d->getBusNumber() << 8) | (d->getDeviceNumber() << 3) | d->getFunctionNumber());
+		uint8_t pm = 0, pcie = 0;
+		d->findPCICapability(kIOPCIPowerManagementCapability, &pm);
+		d->findPCICapability(kIOPCIPCIExpressCapability, &pcie);
+		IOByteCount l1 = 0;
+		if (pcie) d->extendedFindPCICapability(static_cast<UInt32>(-0x1E), &l1);   // L1 PM Substates (extended ID 0x1E, negated)
+		f.pm = pm; f.pcie = pcie; f.l1ss = (uint16_t)l1;
+		const uint64_t phys = pciEcam + ((uint64_t)f.bdf << 12);
+		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(phys, 4096, kIODirectionInOut, kernel_task);
+		if (!md) continue;
+		IOMemoryMap *m = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
+		md->release();
+		if (!m) continue;
+		f.map = m;
+		f.cfg = reinterpret_cast<volatile uint8_t *>(m->getVirtualAddress());
+		if (rd32(f.cfg, 0) != d->configRead32(0)) { m->release(); continue; }   // not this function's ECAM page
+		pciFns[pciCount++] = f;
+	}
+	it->release();
+}
+
 // ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
 constexpr uint8_t TimerVector = 0xF2, SpuriousVector = 0xFF;
 alignas(4096) uint8_t idtCopy[4096];
@@ -512,6 +569,7 @@ void leaveMwait(const ApicSave &s) {
 // ─── the wait ───────────────────────────────────────────────────────────────────────────────────
 void s0ixWait(void *) {
 	runHooks(S0ixHookEnter, 0);
+	if (pciDiag && pciCount) { pciSnapshot(pciSleep); pciSnaps++; }
 	uint8_t snap[MaxGpeBytes], extra[MaxGpeBytes];
 	const unsigned nb = gpe0Bytes;
 	// Only GPEs the OS armed for wake (GPE0 enable) may end the wait, plus the extra wake GPEs.
@@ -747,6 +805,30 @@ int pmcDiagHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
 	if (!error && r->newptr && pmcDiag && platformReady) preparePmc();
 	return error;
 }
+int pciDiagHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
+	const int error = intHandler(o, &pciDiag, 0, 1, r);
+	if (!error && r->newptr && pciDiag) preparePci();
+	return error;
+}
+// One line per function: "bb:dd.f id pm=D? lnk=<ctl>/<sts> dc2=<devctl2> l1ss=<ctl1>" for the snapshot of the last
+// sleep, then the same for now ("live").
+char pciText[PciMax * 2 * 64 + 200];
+PciSnap pciLiveSnap[PciMax];
+int pciHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	size_t u = (size_t)snprintf(pciText, sizeof(pciText), "ecam=0x%llx functions=%u sleeps=%u\n", pciEcam, pciCount, pciSnaps);
+	pciSnapshot(pciLiveSnap);
+	for (int pass = 0; pass < 2; pass++) {
+		const PciSnap *v = pass ? pciLiveSnap : pciSleep;
+		u += (size_t)snprintf(pciText + u, sizeof(pciText) - u, "%s\n", pass ? "live:" : "sleep:");
+		for (unsigned i = 0; i < pciCount && u + 80 < sizeof(pciText); i++) {
+			const PciFn &f = pciFns[i];
+			u += (size_t)snprintf(pciText + u, sizeof(pciText) - u, "%02x:%02x.%x %04x:%04x pm=D%u lnk=%04x/%04x dc2=%04x l1ss=%08x\n",
+				f.bdf >> 8, (f.bdf >> 3) & 0x1F, f.bdf & 7, v[i].id & 0xFFFF, v[i].id >> 16,
+				v[i].pmcsr == 0xFFFFFFFFU ? 9U : v[i].pmcsr & 3, v[i].lnk & 0xFFFF, v[i].lnk >> 16, v[i].dc2 & 0xFFFF, v[i].l1ss);
+		}
+	}
+	return sysctl_handle_string(oidp, pciText, sizeof(pciText), req);
+}
 // "base=0x... ranges=off:count,... live=<hex> start=<hex> end=<hex>" (hex dwords, the ranges concatenated)
 char pmcText[3 * PmcDwords * 9 + 160];
 int pmcHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
@@ -875,6 +957,8 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, period, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0,
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_replay, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, replayHandler, "I", "1 = run consumed EC events' _Qxx after wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pmcDiagHandler, "I", "1 = PCH PMC snapshots around sleep");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC registers (live/start/end)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pciDiagHandler, "I", "1 = PCI power/link snapshot inside each sleep");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pciHandler, "A", "PCI D-state, ASPM, LTR enable and L1 substates (sleep/live)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, safetyHandler, "I", "wake after N s (0 never)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, gtreset, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, gtHandler, "I", "1 = reset the Intel GT on wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_ignore, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, listHandler, "A", "EC events that do not wake (hex)");
@@ -921,6 +1005,8 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_replay);
 	sysctl_register_oid(&sysctl__debug_s0ix_pmc_diag);
 	sysctl_register_oid(&sysctl__debug_s0ix_pmc);
+	sysctl_register_oid(&sysctl__debug_s0ix_pci_diag);
+	sysctl_register_oid(&sysctl__debug_s0ix_pci);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_gtreset);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_ignore);
