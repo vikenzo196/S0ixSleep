@@ -208,7 +208,8 @@ with `SLEEP_L12=00:06.0` the package sleeps at ~0.3 W, 87% of the time in PC10. 
 listed root ports and their devices inside the wait, with the timing values Linux computes (T_POWER_ON and
 Common_Mode_Restore_Time of the slower end, LTR_L1.2_THRESHOLD), only if the device is in D3hot, and restores the
 registers before the wake hooks. `l12=` in the status shows links/applied/skipped. The board must route CLKREQ#
-for the slot; if a sleep with it does not wake, remove the setting.
+for the slot; if a sleep with it does not wake, remove the setting. With `AWAKE_L12=1` the same links also use ASPM L1.2 while
+the machine is awake (`l12_awake=` in the status); the kext programs them again after each wake if needed.
 
 ### Package idle states
 

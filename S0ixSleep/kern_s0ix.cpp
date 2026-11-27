@@ -546,7 +546,7 @@ volatile uint32_t *mapDword(uint64_t phys, IOMemoryMap **out) {
 // D3hot at that point. Opt-in per root port: the board must route the CLKREQ# of that slot.
 constexpr unsigned L12Max = 4;
 struct L12Link {
-	uint16_t port, dev, portL1ss, devL1ss, devPm;
+	uint16_t port, dev, portL1ss, devL1ss, devPm, portExp, devExp;
 	volatile uint8_t *pcfg, *dcfg;
 	IOMemoryMap *pmap, *dmap;
 	uint32_t ctl1Port, ctl1Dev, ctl2, saved[4];
@@ -601,7 +601,9 @@ int l12Prepare(uint64_t ecam, uint16_t portBdf, L12Link &l) {
 	l.portL1ss = findExtCap(l.pcfg, 0x1E);
 	l.devL1ss = findExtCap(l.dcfg, 0x1E);
 	l.devPm = findCap(l.dcfg, 0x01);
-	if (!l.portL1ss || !l.devL1ss || !l.devPm) return ENOTSUP;
+	l.portExp = findCap(l.pcfg, 0x10);
+	l.devExp = findCap(l.dcfg, 0x10);
+	if (!l.portL1ss || !l.devL1ss || !l.devPm || !l.portExp || !l.devExp) return ENOTSUP;
 	const uint32_t pc = rd32(l.pcfg, l.portL1ss + 4), dc = rd32(l.dcfg, l.devL1ss + 4);
 	if (!(pc & dc & 0x01) || !(pc & dc & 0x10)) return ENOTSUP;   // PCI-PM L1.2 and L1 PM Substates on both ends
 	// As Linux aspm_calc_l12_info: the larger Common_Mode_Restore_Time and T_POWER_ON of the two ends, and
@@ -624,6 +626,7 @@ void l12Apply() {
 		if ((rd32(l.dcfg, l.devPm + 4) & 3) != 3) { l12Skipped++; continue; }   // device not in D3hot: leave the link alone
 		volatile uint32_t *p1 = reinterpret_cast<volatile uint32_t *>(l.pcfg + l.portL1ss + 8), *p2 = p1 + 1;
 		volatile uint32_t *d1 = reinterpret_cast<volatile uint32_t *>(l.dcfg + l.devL1ss + 8), *d2 = d1 + 1;
+		if ((*p1 & 1) && (*d1 & 1)) { l12Applied++; continue; }   // already in place (awake L1.2): nothing to change
 		l.saved[0] = *p1; l.saved[1] = *p2; l.saved[2] = *d1; l.saved[3] = *d2;
 		*p2 = l.ctl2; *d2 = l.ctl2;                 // T_POWER_ON, upstream end first
 		*p1 = l.ctl1Port; *d1 = l.ctl1Dev;          // thresholds and PCI-PM L1.2 enable, upstream end first
@@ -640,6 +643,41 @@ void l12Restore() {
 		*d1 = l.saved[2]; *p1 = l.saved[0];         // disable, downstream end first (wakes the link out of L1.2)
 		*d2 = l.saved[3]; *p2 = l.saved[1];
 		l.active = false;
+	}
+}
+
+// ASPM L1.2 while awake (AWAKE_L12 / debug.s0ix.l12_awake) on the SLEEP_L12 links, with the order Linux uses in
+// pcie_config_aspm_link: ASPM L1 off on both ends (device first), timing and thresholds, L1.2 enables (ASPM and PCI-PM,
+// port first), ASPM L1 back on (port first). Programmed again after each wake if the registers came back without it.
+int l12Awake = 0;
+uint32_t l12AwakeRuns = 0;
+thread_call_t l12AwakeCall = nullptr;
+void l12AwakeSet(bool on) {
+	for (unsigned i = 0; i < l12Count; i++) {
+		L12Link &l = l12[i];
+		volatile uint16_t *pl = reinterpret_cast<volatile uint16_t *>(l.pcfg + l.portExp + 0x10);
+		volatile uint16_t *dl = reinterpret_cast<volatile uint16_t *>(l.dcfg + l.devExp + 0x10);
+		volatile uint32_t *p1 = reinterpret_cast<volatile uint32_t *>(l.pcfg + l.portL1ss + 8), *p2 = p1 + 1;
+		volatile uint32_t *d1 = reinterpret_cast<volatile uint32_t *>(l.dcfg + l.devL1ss + 8), *d2 = d1 + 1;
+		if ((rd32(l.dcfg, 0) == 0xFFFFFFFFU) || (rd32(l.dcfg, l.devPm + 4) & 3)) continue;   // device gone or not in D0
+		const uint16_t pAspm = *pl & 3, dAspm = *dl & 3;
+		*dl = (uint16_t)(*dl & ~3U); *pl = (uint16_t)(*pl & ~3U);
+		if (on) {
+			*p2 = l.ctl2; *d2 = l.ctl2;
+			*p1 = (l.ctl1Port & ~0xFU); *d1 = (l.ctl1Dev & ~0xFU);
+			*p1 = l.ctl1Port | 0x5; *d1 = l.ctl1Dev | 0x5;   // ASPM L1.2 and PCI-PM L1.2
+		} else {
+			*d1 = 0; *p1 = 0; *d2 = 0; *p2 = 0;
+		}
+		*pl = (uint16_t)(*pl | pAspm); *dl = (uint16_t)(*dl | dAspm);
+		l12AwakeRuns++;
+	}
+}
+void l12AwakeWork(thread_call_param_t, thread_call_param_t) {
+	if (!l12Awake) return;
+	for (unsigned i = 0; i < l12Count; i++) {
+		const L12Link &l = l12[i];
+		if ((rd32(l.pcfg, l.portL1ss + 8) & 5) != 5 || (rd32(l.dcfg, l.devL1ss + 8) & 5) != 5) { l12AwakeSet(true); break; }
 	}
 }
 
@@ -1145,6 +1183,11 @@ IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size
 	if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) ishShutdown();
 	if (type == kIOMessageSystemWillSleep && battCall) { __atomic_store_n(&battLeft, 0U, __ATOMIC_RELEASE); thread_call_cancel(battCall); }
 	if (type == kIOMessageSystemHasPoweredOn) battStart(4, 0, 5);
+	if (type == kIOMessageSystemHasPoweredOn && l12Awake && l12AwakeCall) {   // the NVMe driver is back in D0 by then
+		uint64_t deadline;
+		clock_interval_to_deadline(2, kSecondScale, &deadline);
+		thread_call_enter_delayed(l12AwakeCall, deadline);
+	}
 	if (type == kIOMessageSystemHasPoweredOn && pitStop && (pitStatus() & 0x0E) != 0) pitHalt();   // counting again: stop
 	if (type == kIOMessageSystemHasPoweredOn && ishWake && ishCall) {
 		uint64_t deadline;
@@ -1218,6 +1261,17 @@ int l12Set(const char *text) {
 	l12Count = count;
 	for (unsigned i = 0; i < oldCount; i++) { old[i].pmap->release(); old[i].dmap->release(); }
 	strlcpy(l12Text, text, sizeof(l12Text));
+	return 0;
+}
+int l12AwakeHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = l12Awake;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value != 0 && value != 1) return EINVAL;
+	if (value && !l12Count) return ENODEV;
+	if (__atomic_load_n(&shared.sleeping, __ATOMIC_ACQUIRE)) return EBUSY;
+	l12Awake = value;
+	l12AwakeSet(value == 1);
 	return 0;
 }
 int l12Handler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
@@ -1518,13 +1572,13 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu psys_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u l12=%u/%u/%u ish=%d/%u/%u/0x%x pit=%d/%u/0x%x>0x%x/0x%x",
+		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u l12=%u/%u/%u l12_awake=%d/%u ish=%d/%u/%u/0x%x pit=%d/%u/0x%x>0x%x/0x%x",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastPsysMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
-		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, cfgwCount, cfgwApplied, l12Count, l12Applied, l12Skipped, ishWake, ishRuns, ishOk, ishLast, pitStop, pitStops, pitStatusBefore, pitStatusAfter, pitStatus());
+		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, cfgwCount, cfgwApplied, l12Count, l12Applied, l12Skipped, l12Awake, l12AwakeRuns, ishWake, ishRuns, ishOk, ishLast, pitStop, pitStops, pitStatusBefore, pitStatusAfter, pitStatus());
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -1541,6 +1595,7 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgw, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, cfgwHandler, "A", "register writes/reads inside the wait: bb:dd.f:off or mADDR, =value/mask to write (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pit, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pitHandler, "I", "1 = stop 8254 PIT counter 0 now and after each wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ish, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, ishHandler, "I", "1 = bring the ISH firmware up (reset handshake) now and after each wake");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, l12_awake, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, l12AwakeHandler, "I", "1 = ASPM L1.2 also while awake on the l12 links");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, l12, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, l12Handler, "A", "root ports whose link goes to PCI-PM L1.2 in sleep: bb:dd.f,... (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgr, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, cfgrHandler, "A", "cfgw entries: values before, at the start and at the end of the last wait");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, mmio, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, mmioHandler, "A", "physical dword: ADDR selects, ADDR=value/mask writes now (hex)");
@@ -1578,6 +1633,7 @@ void S0ix::install(KernelPatcher &patcher) {
 		replayCall = thread_call_allocate(replayWork, nullptr);
 		battCall = thread_call_allocate(battWork, nullptr);
 		ishCall = thread_call_allocate(ishWork, nullptr);
+		l12AwakeCall = thread_call_allocate(l12AwakeWork, nullptr);
 		if (PE_parse_boot_argn("s0ixbatt", arg, sizeof(arg)) && arg[0] == '0') battRefresh = 0;
 		battStart(16, 15, 20);   // boot: every 15 s from 20 s to about 4 min
 		rdmsrCarefully = patcher.solveSymbol(KernelPatcher::KernelID, "_rdmsr_carefully");
@@ -1599,6 +1655,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_pci_diag);
 	sysctl_register_oid(&sysctl__debug_s0ix_pci);
 	sysctl_register_oid(&sysctl__debug_s0ix_l12);
+	sysctl_register_oid(&sysctl__debug_s0ix_l12_awake);
 	// Register access tools for experiments (physical memory and PCI config writes, the 8254 and the ISH handshake):
 	// only with the boot argument -s0ixdebug, since they give root raw access to physical memory.
 	if (checkKernelArgument("-s0ixdebug")) {
