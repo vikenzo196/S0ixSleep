@@ -464,6 +464,31 @@ void preparePci() {
 	it->release();
 }
 
+// Sleep-time config writes (debug.s0ix.cfgw, for experiments): PCI config dwords changed inside the wait, after
+// every driver and hook has run, and put back before the wake hooks. "bb:dd.f:off=value/mask,..." (hex): the bits in
+// mask take value. Used to find out which PCH function keeps the package awake without touching its driver.
+constexpr unsigned CfgwMax = 8;
+struct Cfgw { uint16_t bdf, off; uint32_t value, mask, saved; volatile uint8_t *cfg; IOMemoryMap *map; };
+Cfgw cfgw[CfgwMax];
+unsigned cfgwCount = 0;
+uint32_t cfgwApplied = 0;
+char cfgwText[160] = "";
+void cfgwApply() {
+	for (unsigned i = 0; i < cfgwCount; i++) {
+		volatile uint32_t *r = reinterpret_cast<volatile uint32_t *>(cfgw[i].cfg + cfgw[i].off);
+		cfgw[i].saved = *r;
+		*r = (cfgw[i].saved & ~cfgw[i].mask) | (cfgw[i].value & cfgw[i].mask);
+	}
+	if (cfgwCount) cfgwApplied++;
+}
+void cfgwRestore() {
+	for (unsigned i = cfgwCount; i-- > 0;) {
+		volatile uint32_t *r = reinterpret_cast<volatile uint32_t *>(cfgw[i].cfg + cfgw[i].off);
+		*r = cfgw[i].saved;
+	}
+	if (cfgwCount) IODelay(10000);   // D3hot → D0 needs 10 ms before the function is touched again
+}
+
 // ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
 constexpr uint8_t TimerVector = 0xF2, SpuriousVector = 0xFF;
 alignas(4096) uint8_t idtCopy[4096];
@@ -582,6 +607,7 @@ void leaveMwait(const ApicSave &s) {
 // ─── the wait ───────────────────────────────────────────────────────────────────────────────────
 void s0ixWait(void *) {
 	runHooks(S0ixHookEnter, 0);
+	cfgwApply();
 	if (pciDiag && pciCount) { pciSnapshot(pciSleep); pciSnaps++; }
 	uint8_t snap[MaxGpeBytes], extra[MaxGpeBytes];
 	const unsigned nb = gpe0Bytes;
@@ -719,6 +745,7 @@ void s0ixWait(void *) {
 		} else lastPkgMw = lastCoreMw = 0;
 	}
 	if (reason == 1) outw(pm1Sts, Pm1PwrBtn);
+	cfgwRestore();
 	if (gtReset && gtMmio) resetGt();   // legacy option; graphics kexts should do this from a hook
 	runHooks(S0ixHookExit, reason);
 	lastReason = reason;
@@ -863,6 +890,60 @@ int pmcDiagHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
 	if (!error && r->newptr && pmcDiag && platformReady) preparePmc();
 	return error;
 }
+uint32_t hexField(const char *&p, char stop) {
+	uint32_t v = 0;
+	while (*p && *p != stop) {
+		const char c = *p++;
+		v = (v << 4) | (uint32_t)(c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 0);
+	}
+	if (*p == stop) p++;
+	return v;
+}
+int cfgwHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	char buf[sizeof(cfgwText)];
+	strlcpy(buf, cfgwText, sizeof(buf));
+	const int error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error || !req->newptr) return error;
+	if (__atomic_load_n(&shared.sleeping, __ATOMIC_ACQUIRE)) return EBUSY;
+	uint64_t ecam = 0;
+	if (OSNumber *n = OSDynamicCast(OSNumber, IOService::getPlatform() ? IOService::getPlatform()->getProperty("acpi-mmcfg-seg0") : nullptr))
+		ecam = n->unsigned64BitValue();
+	if (!ecam || (ecam & 0xFFFFF)) return ENODEV;
+	Cfgw parsed[CfgwMax] {};
+	unsigned count = 0;
+	for (const char *p = buf; *p && count < CfgwMax;) {
+		Cfgw c {};
+		const uint32_t bus = hexField(p, ':'), dev = hexField(p, '.'), fn = hexField(p, ':');
+		c.off = (uint16_t)(hexField(p, '=') & 0xFFC);
+		c.value = hexField(p, '/');
+		c.mask = hexField(p, ',');
+		if (bus > 0xFF || dev > 0x1F || fn > 7 || !c.mask) return EINVAL;
+		c.bdf = (uint16_t)((bus << 8) | (dev << 3) | fn);
+		parsed[count++] = c;
+	}
+	// Map the new pages first, then swap; old maps are released after.
+	for (unsigned i = 0; i < count; i++) {
+		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(ecam + ((uint64_t)parsed[i].bdf << 12), 4096, kIODirectionInOut);
+		IOMemoryMap *m = md ? md->map(kIOMapInhibitCache) : nullptr;
+		if (md) md->release();
+		if (!m || !m->getVirtualAddress() || *reinterpret_cast<volatile uint32_t *>(m->getVirtualAddress()) == 0xFFFFFFFFU) {
+			if (m) m->release();
+			for (unsigned j = 0; j < i; j++) parsed[j].map->release();
+			return ENOENT;
+		}
+		parsed[i].map = m;
+		parsed[i].cfg = reinterpret_cast<volatile uint8_t *>(m->getVirtualAddress());
+	}
+	Cfgw old[CfgwMax];
+	const unsigned oldCount = cfgwCount;
+	for (unsigned i = 0; i < oldCount; i++) old[i] = cfgw[i];
+	cfgwCount = 0;
+	for (unsigned i = 0; i < count; i++) cfgw[i] = parsed[i];
+	cfgwCount = count;
+	for (unsigned i = 0; i < oldCount; i++) old[i].map->release();
+	strlcpy(cfgwText, buf, sizeof(cfgwText));
+	return 0;
+}
 int pciDiagHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
 	const int error = intHandler(o, &pciDiag, 0, 1, r);
 	if (!error && r->newptr && pciDiag) preparePci();
@@ -1001,13 +1082,13 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u",
+		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
-		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies);
+		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, cfgwCount, cfgwApplied);
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -1021,6 +1102,7 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_replay, CTLTYPE_INT | CTLFLAG_RW, nullptr,
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pmcDiagHandler, "I", "1 = PCH PMC snapshots around sleep");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC registers (live/start/end)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pciDiagHandler, "I", "1 = PCI power/link snapshot inside each sleep");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgw, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, cfgwHandler, "A", "PCI config writes inside the wait, restored at wake: bb:dd.f:off=value/mask,... (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pciHandler, "A", "PCI D-state, ASPM, LTR enable and L1 substates (sleep/live)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, batt_refresh, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, battHandler, "I", "1 = battery re-read after wake and boot");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, safetyHandler, "I", "wake after N s (0 never)");
@@ -1074,6 +1156,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_pmc);
 	sysctl_register_oid(&sysctl__debug_s0ix_pci_diag);
 	sysctl_register_oid(&sysctl__debug_s0ix_pci);
+	sysctl_register_oid(&sysctl__debug_s0ix_cfgw);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_batt_refresh);
 	sysctl_register_oid(&sysctl__debug_s0ix_gtreset);
