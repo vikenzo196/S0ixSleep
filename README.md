@@ -210,6 +210,14 @@ Common_Mode_Restore_Time of the slower end, LTR_L1.2_THRESHOLD), only if the dev
 registers before the wake hooks. `l12=` in the status shows links/applied/skipped. The board must route CLKREQ#
 for the slot; if a sleep with it does not wake, remove the setting.
 
+### Integrated Sensor Hub
+
+macOS has no driver for the Intel Integrated Sensor Hub. Its firmware then stays in "wait for host" and is never
+power gated, one of the blocks that keep the chipset out of SLP_S0. With `ISH_WAKE=1` the kext does the reset
+handshake of the Linux driver at boot and after each wake (host ready, DMA enable, management reset notify, and the
+acknowledgement of the firmware's own reset notify). The firmware comes up and, with no client talking to it, power
+gates itself (PMC PPFEAR ISH = 1, awake and asleep). `ish=` in the status shows enabled/runs/successes/firmware status.
+
 ### Package idle states
 
 `pc=` in the status is the share of the last sleep (per mille) the package spent in PC2, PC3, PC6, PC7,

@@ -470,7 +470,7 @@ void preparePci() {
 // start and at the end of the wait (debug.s0ix.cfgr). Used to find the PCH function that keeps the package awake
 // without touching its driver.
 constexpr unsigned CfgwMax = 12;
-struct Cfgw { bool write; uint32_t value, mask, saved, atEnter, atExit; volatile uint32_t *reg; IOMemoryMap *map; char label[24]; };
+struct Cfgw { bool write; uint32_t value, mask, saved, atEnter, atExit; volatile uint32_t *reg; IOMemoryMap *map; char label[24]; uint32_t delayMs; };
 Cfgw cfgw[CfgwMax];
 unsigned cfgwCount = 0;
 uint32_t cfgwApplied = 0;
@@ -479,6 +479,7 @@ char cfgwText[256] = "";
 void cfgwApply() {
 	for (unsigned i = 0; i < cfgwCount; i++) {
 		Cfgw &c = cfgw[i];
+		if (c.delayMs) { IODelay(c.delayMs * 1000); continue; }
 		if (c.write) { c.saved = *c.reg; *c.reg = (c.saved & ~c.mask) | (c.value & c.mask); }
 		c.atEnter = *c.reg;
 	}
@@ -487,6 +488,7 @@ void cfgwApply() {
 void cfgwRestore() {
 	for (unsigned i = cfgwCount; i-- > 0;) {
 		Cfgw &c = cfgw[i];
+		if (c.delayMs) { IODelay(c.delayMs * 1000); continue; }
 		c.atExit = *c.reg;
 		if (c.write) *c.reg = c.saved;
 	}
@@ -608,6 +610,88 @@ void l12Restore() {
 		l.active = false;
 	}
 }
+
+// Intel Integrated Sensor Hub wake-up (ISH_WAKE / debug.s0ix.ish). Without a host driver the ISH firmware stays in
+// WAIT_FOR_HOST and is never power gated, which keeps the PCH out of its deepest state (SLP_S0). The reset handshake of
+// the Linux driver (intel-ish-ipc: host ready, DMA enable, MNG_RESET_NOTIFY, answer the firmware's own
+// MNG_RESET_NOTIFY with MNG_RESET_NOTIFY_ACK) brings the firmware up (ILUP, ISHTP ready, sensor app running); with no
+// client talking to it, it then power gates itself, awake and asleep. Only for the ISH generations that run firmware
+// from flash (Broxton to Raptor Lake); the IPC registers are as in Linux hw-ish-regs.h.
+constexpr uint16_t IshIds[] = {0x0AA2, 0x1AA2, 0x5AA2, 0x9D35, 0x9DFC, 0x31A2, 0xA37C, 0x34FC, 0xA135, 0x02FC, 0x06FC,
+	0x4BB3, 0xA0FC, 0x43FC, 0x7AF8, 0x51FC, 0x54FC, 0x7A78};
+constexpr unsigned IshFwSts = 0x34, IshHostComm = 0x38, IshH2iDrbl = 0x48, IshI2hDrbl = 0x54, IshI2hMsg = 0x60,
+	IshH2iMsg = 0xE0, IshRmp2 = 0x368;
+IOPCIDevice *ishDev = nullptr;
+IOMemoryMap *ishMap = nullptr;
+volatile uint8_t *ishMmio = nullptr;
+int ishWake = 0;
+uint32_t ishRuns = 0, ishOk = 0, ishLast = 0;
+thread_call_t ishCall = nullptr;
+uint32_t ishRd(unsigned off) { return *reinterpret_cast<volatile uint32_t *>(ishMmio + off); }
+void ishWr(unsigned off, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(ishMmio + off) = v; }
+bool ishSendMng(uint32_t cmd, uint32_t payload) {
+	for (unsigned i = 0; i < 100 && (ishRd(IshH2iDrbl) & 0x80000000U); i++) IOSleep(1);
+	if (ishRd(IshH2iDrbl) & 0x80000000U) return false;
+	ishWr(IshH2iMsg, payload);
+	ishWr(IshH2iDrbl, 0x80000000U | (3U << 10) | (cmd << 16) | 4U);   // busy, protocol MNG, command, 4 bytes
+	return true;
+}
+// Thread context only (sleeps). Returns true when the firmware reports ILUP + ISHTP ready.
+bool ishHandshake() {
+	if (!ishDev) {
+		OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+		while (it && !ishDev) {
+			OSObject *o = it->getNextObject();
+			if (!o) break;
+			IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
+			if (!d || d->configRead16(0) != 0x8086 || d->getBusNumber() != 0) continue;
+			const uint16_t id = d->configRead16(2);
+			for (uint16_t k : IshIds) if (k == id) { ishDev = d; d->retain(); break; }
+		}
+		if (it) it->release();
+		if (!ishDev) return false;
+	}
+	ishRuns++;
+	uint8_t pm = 0;
+	ishDev->findPCICapability(kIOPCIPowerManagementCapability, &pm);
+	if (pm && (ishDev->configRead16(pm + 4) & 3)) { ishDev->configWrite16(pm + 4, (uint16_t)(ishDev->configRead16(pm + 4) & ~3U)); IOSleep(10); }
+	ishDev->setMemoryEnable(true);
+	ishDev->setBusMasterEnable(true);
+	if (!ishMap) {
+		ishMap = ishDev->mapDeviceMemoryWithIndex(0);
+		if (!ishMap) return false;
+		ishMmio = reinterpret_cast<volatile uint8_t *>(ishMap->getVirtualAddress());
+	}
+	ishLast = ishRd(IshFwSts);
+	if ((ishLast & 3) == 3) { ishOk++; return true; }   // already up
+	ishWr(IshHostComm, ishRd(IshHostComm) | 0x80);         // host ready
+	ishWr(IshRmp2, 1);                                      // DMA enabled
+	ishWr(IshI2hDrbl, 0);
+	if (!ishSendMng(3, 1)) return false;                    // MNG_RESET_NOTIFY, reset id 1
+	for (unsigned i = 0; i < 200; i++) {                    // up to 2 s, as Linux TIMEOUT_FOR_FW_RDY_MS
+		const uint32_t d = ishRd(IshI2hDrbl);
+		if (d & 0x80000000U) {
+			if (((d >> 10) & 0xF) == 3 && ((d >> 16) & 0x3F) == 3) {   // the firmware's MNG_RESET_NOTIFY: acknowledge it
+				const uint32_t resetId = ishRd(IshI2hMsg) & 0xFFFF;
+				ishWr(IshHostComm, ishRd(IshHostComm) | 0x80);
+				ishSendMng(4, resetId);
+			}
+			ishWr(IshI2hDrbl, 0);
+		}
+		ishLast = ishRd(IshFwSts);
+		if ((ishLast & 3) == 3) break;
+		IOSleep(10);
+	}
+	for (unsigned i = 0; i < 20; i++) {   // the completion indication of our ACK
+		if (ishRd(IshI2hDrbl) & 0x80000000U) ishWr(IshI2hDrbl, 0);
+		IOSleep(10);
+	}
+	ishLast = ishRd(IshFwSts);
+	if ((ishLast & 3) != 3) return false;
+	ishOk++;
+	return true;
+}
+void ishWork(thread_call_param_t, thread_call_param_t) { if (ishWake) ishHandshake(); }
 
 // ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
 constexpr uint8_t TimerVector = 0xF2, SpuriousVector = 0xFF;
@@ -966,6 +1050,11 @@ IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size
 	}
 	if (type == kIOMessageSystemWillSleep && battCall) { __atomic_store_n(&battLeft, 0U, __ATOMIC_RELEASE); thread_call_cancel(battCall); }
 	if (type == kIOMessageSystemHasPoweredOn) battStart(4, 0, 5);
+	if (type == kIOMessageSystemHasPoweredOn && ishWake && ishCall) {
+		uint64_t deadline;
+		clock_interval_to_deadline(3, kSecondScale, &deadline);
+		thread_call_enter_delayed(ishCall, deadline);
+	}
 	if (type == kIOMessageSystemWillSleep && enabled == 1 && platformReady) __atomic_store_n(&shared.sleeping, 1U, __ATOMIC_RELEASE);
 	else if (type == kIOMessageSystemHasPoweredOn) __atomic_store_n(&shared.sleeping, 0U, __ATOMIC_RELEASE);
 	return kIOReturnSuccess;
@@ -1042,6 +1131,15 @@ int l12Handler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	if (error || !req->newptr) return error;
 	return l12Set(buf);
 }
+int ishHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = ishWake;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value != 0 && value != 1) return EINVAL;
+	ishWake = value;
+	if (value && !ishHandshake()) return EIO;
+	return 0;
+}
 int periodHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &periodMs, 5, 1000, r); }
 int replayHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &ecReplay, 0, 1, r); }
 int pmcDiagHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
@@ -1074,6 +1172,15 @@ int cfgwHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		Cfgw c {};
 		const char *begin = p;
 		uint64_t phys;
+		if (*p == 'd' || *p == 'D') {   // "dN": wait N ms (1-50) at this point, both ways
+			p++;
+			c.delayMs = (uint32_t)hexField64(p, ",");
+			if (*p == ',') p++;
+			if (!c.delayMs || c.delayMs > 0x50) { err = EINVAL; break; }
+			strlcpy(c.label, "delay", sizeof(c.label));
+			parsed[count++] = c;
+			continue;
+		}
 		if (*p == 'm' || *p == 'M') {
 			p++;
 			phys = hexField64(p, "=,");
@@ -1099,7 +1206,7 @@ int cfgwHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		if (!c.reg || (*c.reg == 0xFFFFFFFFU && !(*begin == 'm' || *begin == 'M'))) { if (c.map) c.map->release(); err = ENOENT; break; }
 		parsed[count++] = c;
 	}
-	if (err) { for (unsigned j = 0; j < count; j++) parsed[j].map->release(); return err; }
+	if (err) { for (unsigned j = 0; j < count; j++) if (parsed[j].map) parsed[j].map->release(); return err; }
 	Cfgw old[CfgwMax];
 	const unsigned oldCount = cfgwCount;
 	for (unsigned i = 0; i < oldCount; i++) old[i] = cfgw[i];
@@ -1108,7 +1215,7 @@ int cfgwHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	for (unsigned i = 0; i < count; i++) { cfgw[i] = parsed[i]; any |= parsed[i].write; }
 	cfgwAnyWrite = any;
 	cfgwCount = count;
-	for (unsigned i = 0; i < oldCount; i++) old[i].map->release();
+	for (unsigned i = 0; i < oldCount; i++) if (old[i].map) old[i].map->release();
 	strlcpy(cfgwText, buf, sizeof(cfgwText));
 	return 0;
 }
@@ -1118,6 +1225,7 @@ int cfgrHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	cfgrText[0] = '\0';
 	for (unsigned i = 0; i < cfgwCount && u + 80 < sizeof(cfgrText); i++) {
 		const Cfgw &c = cfgw[i];
+		if (c.delayMs) continue;
 		u += (size_t)snprintf(cfgrText + u, sizeof(cfgrText) - u, "%s: before=%08x enter=%08x exit=%08x now=%08x\n",
 			c.label, c.write ? c.saved : c.atEnter, c.atEnter, c.atExit, *c.reg);
 	}
@@ -1295,13 +1403,13 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u l12=%u/%u/%u",
+		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u l12=%u/%u/%u ish=%d/%u/%u/0x%x",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
-		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, cfgwCount, cfgwApplied, l12Count, l12Applied, l12Skipped);
+		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, cfgwCount, cfgwApplied, l12Count, l12Applied, l12Skipped, ishWake, ishRuns, ishOk, ishLast);
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -1316,6 +1424,7 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC registers (live/start/end)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pciDiagHandler, "I", "1 = PCI power/link snapshot inside each sleep");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgw, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, cfgwHandler, "A", "register writes/reads inside the wait: bb:dd.f:off or mADDR, =value/mask to write (hex)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, ish, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, ishHandler, "I", "1 = bring the ISH firmware up (reset handshake) now and after each wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, l12, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, l12Handler, "A", "root ports whose link goes to PCI-PM L1.2 in sleep: bb:dd.f,... (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgr, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, cfgrHandler, "A", "cfgw entries: values before, at the start and at the end of the last wait");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, mmio, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, mmioHandler, "A", "physical dword: ADDR selects, ADDR=value/mask writes now (hex)");
@@ -1352,6 +1461,7 @@ void S0ix::install(KernelPatcher &patcher) {
 		userWakeCall = requestUserActive ? thread_call_allocate(userWakeWork, nullptr) : nullptr;
 		replayCall = thread_call_allocate(replayWork, nullptr);
 		battCall = thread_call_allocate(battWork, nullptr);
+		ishCall = thread_call_allocate(ishWork, nullptr);
 		if (PE_parse_boot_argn("s0ixbatt", arg, sizeof(arg)) && arg[0] == '0') battRefresh = 0;
 		battStart(16, 15, 20);   // boot: every 15 s from 20 s to about 4 min
 		rdmsrCarefully = patcher.solveSymbol(KernelPatcher::KernelID, "_rdmsr_carefully");
@@ -1375,6 +1485,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_cfgw);
 	sysctl_register_oid(&sysctl__debug_s0ix_cfgr);
 	sysctl_register_oid(&sysctl__debug_s0ix_l12);
+	sysctl_register_oid(&sysctl__debug_s0ix_ish);
 	sysctl_register_oid(&sysctl__debug_s0ix_mmio);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_batt_refresh);
