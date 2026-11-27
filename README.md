@@ -54,13 +54,13 @@ on a charged battery, not for leaving a laptop asleep in a bag for days.
 |---|---|
 | Wake | lid open, any key, power button; display back in about 2 s |
 | Whole machine while asleep (battery gauge, `tools/sleep-power.sh`) | about 4.9 W (66 Wh battery: about 13 h) |
-| CPU package while asleep (RAPL) | about 1.8 W with `wait 2` (package in PC3 98% of the time); 2.9 W with `wait 1` |
+| CPU package while asleep (RAPL) | about 0.3 W, PC10 87% of the time, with `SLEEP_L12` and the display engine in DC5 (graphics kext); about 1.8 W in PC3 without them; 2.9 W with `wait 1` |
 | Fans, power LED | off (with the SSDT that tells the EC about Modern Standby) |
 | Time to fall asleep | about 17 s, mostly powerd's own dark wake delay |
 
-The package stops at PC3 on this machine because its display engine stays on (see
-[Package idle states](#package-idle-states)); taking the Wi-Fi card down during the sleep made no measurable
-difference, and macOS already turns the NVMe controller off at every sleep.
+Two things held the package in PC3 on this machine (see [Package idle states](#package-idle-states)): the display
+engine, which only a graphics driver can take to DC5, and the NVMe link, which macOS leaves in plain L1
+([PCIe L1.2 in sleep](#pcie-l12-in-sleep)). Taking the Wi-Fi card down during the sleep made no measurable difference.
 
 ## Requirements
 
@@ -210,24 +210,20 @@ Common_Mode_Restore_Time of the slower end, LTR_L1.2_THRESHOLD), only if the dev
 registers before the wake hooks. `l12=` in the status shows links/applied/skipped. The board must route CLKREQ#
 for the slot; if a sleep with it does not wake, remove the setting.
 
-### Integrated Sensor Hub
-
-macOS has no driver for the Intel Integrated Sensor Hub. Its firmware then stays in "wait for host" and is never
-power gated, one of the blocks that keep the chipset out of SLP_S0. With `ISH_WAKE=1` the kext does the reset
-handshake of the Linux driver at boot and after each wake (host ready, DMA enable, management reset notify, and the
-acknowledgement of the firmware's own reset notify). The firmware comes up and, with no client talking to it, power
-gates itself (PMC PPFEAR ISH = 1, awake and asleep). `ish=` in the status shows enabled/runs/successes/firmware status.
-
 ### Package idle states
 
 `pc=` in the status is the share of the last sleep (per mille) the package spent in PC2, PC3, PC6, PC7,
 PC8, PC9 and PC10; `core_c7_ms` is the time the waiting core spent in C7. If the package stops at PC2/PC3,
-something outside the CPU cores keeps it awake. On the tested machine it is the display engine: its pipe
-and eDP link stay on during sleep, because the graphics driver cannot use panel self refresh or the
-display's DC5/DC6 states. With `sudo sysctl debug.s0ix.pmc_diag=1` S0ixSleep also snapshots the PCH power
-management controller around each sleep (latency tolerance of every PCH device and of the whole platform,
-power-gated blocks, SLP_S0 conditions); `python3 tools/pmc_decode.py` decodes `sysctl debug.s0ix.pmc`
-(Intel 300 to 700 series PCH layout).
+something outside the CPU cores keeps it awake. On the tested machine it was the display engine (its pipe and
+eDP link stay on unless the graphics driver uses the display's DC5/DC6 states) and the NVMe link without L1.2. With
+`sudo sysctl debug.s0ix.pmc_diag=1` S0ixSleep also snapshots the PCH power management controller around each sleep
+(latency tolerance of every PCH device and of the whole platform, power-gated blocks, SLP_S0 conditions, low power
+mode status) and `sudo sysctl debug.s0ix.pci_diag=1` the power and link state of every PCI function inside the wait.
+`python3 tools/pmc_decode.py` decodes `sysctl debug.s0ix.pmc` (Intel 300 to 700 series PCH layout). On PCHs with
+S0ix substates (Tiger Lake layout: Tiger Lake, Alder Lake-P/N, Raptor Lake-P) it also reads the substate requirements
+from the firmware, as Linux does (`_DSM` of the Intel Power Engine device), and lists the conditions that kept the
+chipset out of each enabled substate at the first C10 entry of the last sleep. `psys_mw` in the status is the
+platform energy counter over the wait; on some boards it covers only part of the platform.
 
 ### Graphics
 
@@ -267,6 +263,8 @@ python3 tools/build.py --release --output build/RELEASE
 | `-s0ixoff` | do not load |
 | `-s0ixdbg` | debug log (DEBUG build) |
 | `s0ixecign=`, `s0ixecwake=` | EC event lists at boot |
+| `s0ixbatt=0` | no battery re-read after wake and boot |
+| `-s0ixdebug` | register access tools for experiments (`debug.s0ix.cfgw`, `cfgr`, `mmio`, `pit`, `ish`); they give root raw access to physical memory, so they exist only with this argument |
 
 ## Credits
 

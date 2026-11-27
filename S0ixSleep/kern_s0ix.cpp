@@ -366,8 +366,18 @@ void resetGt() {
 // status PPFEAR (0x1D90, as in Linux for Cannon Point and later). Snapshots at the start and the end of the
 // wait; the sysctl also reads them live.
 struct PmcRange { uint16_t off, count; };
-constexpr PmcRange PmcRanges[] = {{0x1098, 1}, {0x10B4, 3}, {0x1700, 48}, {0x193C, 1}, {0x1B0C, 1}, {0x1B50, 48}, {0x1D90, 3}};
-constexpr unsigned PmcDwords = 1 + 3 + 48 + 1 + 1 + 48 + 3;
+// Tiger Lake layout of the low power mode registers (also Alder Lake-P/N and Raptor Lake-P, Linux tgl_l): status latch
+// enable 0x1C34, latched status 0x1C3C (6 maps), live status 0x1C5C, LPM_EN 0x1C78, priority 0x1C7C, residencies 0x1C80.
+// ETR3 (0x1048) bit 28 clears the latched status; the kext clears it at the start of each wait when pmc_diag is on, so
+// the latch shows the conditions at this sleep's first C10 entry.
+constexpr PmcRange PmcRanges[] = {{0x1048, 1}, {0x1098, 1}, {0x10B4, 3}, {0x1700, 48}, {0x193C, 1}, {0x1B0C, 1}, {0x1B50, 48},
+	{0x1C34, 24}, {0x1D90, 3}};
+constexpr unsigned PmcDwords = 1 + 1 + 3 + 48 + 1 + 1 + 48 + 24 + 3;
+// Low power mode requirements, as Linux pmc_core_get_tgl_lpm_reqs: _DSM 57a6512e-3979-4e9d-9708-ff13b2508972 function 1 of
+// the Intel Power Engine device (INT33A1) returns a buffer of 8 modes x maps requirement dwords.
+uint32_t lpmReq[64];
+unsigned lpmReqWords = 0;
+uint32_t lpmReqErr = 0;
 IOMemoryMap *pmcMap = nullptr;
 volatile uint32_t *pmcMmio = nullptr;
 uint64_t pmcBase = 0;
@@ -397,7 +407,29 @@ bool mapPmc(uint64_t base) {
 	return true;
 }
 
+void readLpmReqs() {
+	if (lpmReqWords) return;
+	OSIterator *it = IOService::getMatchingServices(IOService::nameMatching("INT33A1"));
+	OSObject *o = it ? it->getNextObject() : nullptr;
+	IOACPIPlatformDevice *pep = o && o->metaCast("IOACPIPlatformDevice") ? static_cast<IOACPIPlatformDevice *>(o) : nullptr;
+	if (!pep) { lpmReqErr = 1; if (it) it->release(); return; }
+	static const uint8_t uuid[16] = {0x2e, 0x51, 0xa6, 0x57, 0x79, 0x39, 0x9d, 0x4e, 0x97, 0x08, 0xff, 0x13, 0xb2, 0x50, 0x89, 0x72};
+	OSObject *params[4] = {OSData::withBytes(uuid, sizeof(uuid)), OSNumber::withNumber(0ULL, 32), OSNumber::withNumber(1ULL, 32),
+		OSArray::withCapacity(1)};
+	OSObject *result = nullptr;
+	const IOReturn e = params[0] && params[1] && params[2] && params[3] ? pep->evaluateObject("_DSM", &result, params, 4) : kIOReturnNoMemory;
+	for (auto *p : params) if (p) p->release();
+	if (it) it->release();
+	if (OSData *d = OSDynamicCast(OSData, result)) {
+		const unsigned n = d->getLength() / 4 < 64 ? d->getLength() / 4 : 64;
+		memcpy(lpmReq, d->getBytesNoCopy(), n * 4);
+		lpmReqWords = n;
+	} else lpmReqErr = e ? (uint32_t)e : 2;
+	if (result) result->release();
+}
+
 void preparePmc() {
+	if (pmcDiag) readLpmReqs();
 	if (!pmcDiag || pmcMmio || intel != 1) return;
 	UInt32 base = 0;
 	const IOReturn e = ecDevice ? ecDevice->evaluateInteger("\\PWRM", &base) : kIOReturnNotFound;
@@ -906,7 +938,10 @@ void s0ixWait(void *) {
 	uint64_t r0[7] = {};
 	for (unsigned i = 0; i < 7; i++) if (rok & (1U << i)) r0[i] = rdmsr(ResMsr[i]);
 	const bool pmc = pmcDiag && pmcMmio;
-	if (pmc) pmcSnapshot(pmcStart);
+	if (pmc) {
+		pmcMmio[0x1048 / 4] = pmcMmio[0x1048 / 4] | (1U << 28);   // ETR3: clear the latched low power mode status
+		pmcSnapshot(pmcStart);
+	}
 	ApicSave as {};
 	const bool mw = wait == 2 && mwaitReady && tpms && enterMwait(as);
 	const uint64_t mwPeriod = tpms * (uint64_t)periodMs;
@@ -1366,7 +1401,7 @@ int pciHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	return sysctl_handle_string(oidp, pciText, sizeof(pciText), req);
 }
 // "base=0x... ranges=off:count,... live=<hex> start=<hex> end=<hex>" (hex dwords, the ranges concatenated)
-char pmcText[3 * PmcDwords * 9 + 160];
+char pmcText[3 * PmcDwords * 9 + 64 * 9 + 200];
 int pmcHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	size_t u = 0;
 	auto put = [&](const char *label, const uint32_t *v) {
@@ -1382,6 +1417,10 @@ int pmcHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		put("live", live);
 		if (pmcHave) { put("start", pmcStart); put("end", pmcEnd); }
 	}
+	u += (size_t)snprintf(pmcText + u, sizeof(pmcText) - u, " lpmreq=");
+	for (unsigned i = 0; i < lpmReqWords && u + 10 < sizeof(pmcText); i++)
+		u += (size_t)snprintf(pmcText + u, sizeof(pmcText) - u, i ? ",%08x" : "%08x", lpmReq[i]);
+	if (!lpmReqWords) u += (size_t)snprintf(pmcText + u, sizeof(pmcText) - u, "err%x", lpmReqErr);
 	return sysctl_handle_string(oidp, pmcText, sizeof(pmcText), req);
 }
 int battHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
@@ -1559,12 +1598,16 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_pmc);
 	sysctl_register_oid(&sysctl__debug_s0ix_pci_diag);
 	sysctl_register_oid(&sysctl__debug_s0ix_pci);
-	sysctl_register_oid(&sysctl__debug_s0ix_cfgw);
-	sysctl_register_oid(&sysctl__debug_s0ix_cfgr);
 	sysctl_register_oid(&sysctl__debug_s0ix_l12);
-	sysctl_register_oid(&sysctl__debug_s0ix_ish);
-	sysctl_register_oid(&sysctl__debug_s0ix_pit);
-	sysctl_register_oid(&sysctl__debug_s0ix_mmio);
+	// Register access tools for experiments (physical memory and PCI config writes, the 8254 and the ISH handshake):
+	// only with the boot argument -s0ixdebug, since they give root raw access to physical memory.
+	if (checkKernelArgument("-s0ixdebug")) {
+		sysctl_register_oid(&sysctl__debug_s0ix_cfgw);
+		sysctl_register_oid(&sysctl__debug_s0ix_cfgr);
+		sysctl_register_oid(&sysctl__debug_s0ix_mmio);
+		sysctl_register_oid(&sysctl__debug_s0ix_pit);
+		sysctl_register_oid(&sysctl__debug_s0ix_ish);
+	}
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_batt_refresh);
 	sysctl_register_oid(&sysctl__debug_s0ix_gtreset);
