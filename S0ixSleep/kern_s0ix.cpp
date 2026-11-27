@@ -178,7 +178,7 @@ uint32_t replayedLast = 0, replayedTotal = 0;
 int battRefresh = 1;                       // 1 = re-read 5, 15, 30 and 60 s after each wake, every 15 s for 4 min after start
 constexpr unsigned MaxBatteries = 2;
 IOACPIPlatformDevice *batteries[MaxBatteries];
-uint32_t batteryCount = 0, battNotifies = 0, battMsg[3];
+uint32_t batteryCount = 0, battNotifies = 0, battMsg[3], battCap = 0;
 bool batteriesSearched = false;
 thread_call_t battCall = nullptr;
 volatile uint32_t battLeft = 0;            // re-reads still to do in the current series
@@ -1167,7 +1167,7 @@ void battWork(thread_call_param_t, thread_call_param_t) {
 	}
 }
 
-IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size_t) {
+IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *arg, vm_size_t) {
 	if ((type == kIOMessageSystemCapabilityChange || type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn) &&
 	    userWakeCall && __atomic_exchange_n(&userWakePending, false, __ATOMIC_ACQ_REL)) {
 		// Not at once: a graphics driver's dark wake transitions must run first.
@@ -1184,11 +1184,18 @@ IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size
 	if (type == kIOMessageSystemWillSleep && battCall) { __atomic_store_n(&battLeft, 0U, __ATOMIC_RELEASE); thread_call_cancel(battCall); }
 	// Battery re-read: start it on every wake signal, dark wakes included (on 27 Nov a dark wake reached neither
 	// HasPoweredOn nor the re-read, and the EC's wrong reading stayed until the lid opened); a later signal of the same
-	// wake just restarts the series. battMsg counts which signals arrive.
-	if (type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn || type == kIOMessageSystemCapabilityChange) {
-		battMsg[type == kIOMessageSystemWillPowerOn ? 0 : type == kIOMessageSystemHasPoweredOn ? 1 : 2]++;
-		battStart(4, 0, 5);
+	// wake just restarts the series. A capability change counts only when it adds capabilities (a wake, not the way
+	// down to sleep). A longer series still running (the boot one) is left alone: a capability change also arrives at
+	// boot and cut it to 4. battMsg counts which signals arrive, battCap keeps the last capability change.
+	bool battWake = type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn;
+	if (type == kIOMessageSystemCapabilityChange && arg) {
+		auto *p = static_cast<IOPMSystemCapabilityChangeParameters *>(arg);
+		battCap = (p->fromCapabilities & 0xFF) << 16 | (p->toCapabilities & 0xFF) << 8 | (p->changeFlags & 0xFF);
+		battWake = (p->toCapabilities & ~p->fromCapabilities) != 0;
 	}
+	if (type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn || type == kIOMessageSystemCapabilityChange)
+		battMsg[type == kIOMessageSystemWillPowerOn ? 0 : type == kIOMessageSystemHasPoweredOn ? 1 : 2]++;
+	if (battWake && __atomic_load_n(&battLeft, __ATOMIC_ACQUIRE) <= 4) battStart(4, 0, 5);
 	if (type == kIOMessageSystemHasPoweredOn && l12Awake && l12AwakeCall) {   // the NVMe driver is back in D0 by then
 		uint64_t deadline;
 		clock_interval_to_deadline(2, kSecondScale, &deadline);
@@ -1578,13 +1585,13 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu psys_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u battmsg=%u/%u/%u cfgw=%u/%u l12=%u/%u/%u l12_awake=%d/%u ish=%d/%u/%u/0x%x pit=%d/%u/0x%x>0x%x/0x%x",
+		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u battmsg=%u/%u/%u battcap=%06x cfgw=%u/%u l12=%u/%u/%u l12_awake=%d/%u ish=%d/%u/%u/0x%x pit=%d/%u/0x%x>0x%x/0x%x",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastPsysMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
-		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, battMsg[0], battMsg[1], battMsg[2], cfgwCount, cfgwApplied, l12Count, l12Applied, l12Skipped, l12Awake, l12AwakeRuns, ishWake, ishRuns, ishOk, ishLast, pitStop, pitStops, pitStatusBefore, pitStatusAfter, pitStatus());
+		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, battMsg[0], battMsg[1], battMsg[2], battCap, cfgwCount, cfgwApplied, l12Count, l12Applied, l12Skipped, l12Awake, l12AwakeRuns, ishWake, ishRuns, ishOk, ishLast, pitStop, pitStops, pitStatusBefore, pitStatusAfter, pitStatus());
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
