@@ -171,6 +171,18 @@ uint32_t replayMap[8];
 volatile bool replayPending = false;
 thread_call_t replayCall = nullptr;
 uint32_t replayedLast = 0, replayedTotal = 0;
+// Battery re-read. Some embedded controllers (Samsung Galaxy Book3) report a wrong remaining capacity for a few
+// seconds after a wake, and once about a minute after boot. The macOS battery driver (SMCBatteryManager) then keeps
+// that value until its next poll a minute later, or across the next sleep if the wake was a short dark wake. A battery
+// notification (0x80) to each PNP0C0A device makes it read _BST again, so a wrong value lasts seconds, not hours.
+int battRefresh = 1;                       // 1 = re-read 5, 15, 30 and 60 s after each wake, every 15 s for 4 min after start
+constexpr unsigned MaxBatteries = 2;
+IOACPIPlatformDevice *batteries[MaxBatteries];
+uint32_t batteryCount = 0, battNotifies = 0;
+bool batteriesSearched = false;
+thread_call_t battCall = nullptr;
+volatile uint32_t battLeft = 0;            // re-reads still to do in the current series
+volatile uint32_t battGap = 0;             // seconds between them (0: the wake series 5, 15, 30, 60 s)
 // Wait hooks added by other kexts through shared.addHook.
 constexpr unsigned HookSlots = 4;
 struct Hook { volatile S0ixSleepHook fn; void *volatile ctx; };
@@ -747,6 +759,49 @@ void replayWork(thread_call_param_t, thread_call_param_t) {
 	replayedTotal += n;
 }
 
+void battSchedule(uint32_t seconds) {
+	uint64_t deadline;
+	clock_interval_to_deadline(seconds, kSecondScale, &deadline);
+	thread_call_enter_delayed(battCall, deadline);
+}
+
+void battStart(uint32_t left, uint32_t gap, uint32_t first) {
+	if (!battCall || !battRefresh) return;
+	thread_call_cancel(battCall);
+	__atomic_store_n(&battGap, gap, __ATOMIC_RELEASE);
+	__atomic_store_n(&battLeft, left, __ATOMIC_RELEASE);
+	battSchedule(first);
+}
+
+void battWork(thread_call_param_t, thread_call_param_t) {
+	if (!batteriesSearched) {
+		batteriesSearched = true;
+		// The ACPI battery devices (_HID PNP0C0A), found the same way as the EC (no IOACPIFamily link dependency).
+		if (OSIterator *it = IOService::getMatchingServices(IOService::nameMatching("PNP0C0A"))) {
+			while (auto *o = it->getNextObject()) {
+				if (batteryCount < MaxBatteries && o->metaCast("IOACPIPlatformDevice")) {
+					auto *d = static_cast<IOACPIPlatformDevice *>(o);
+					d->retain();
+					batteries[batteryCount++] = d;
+				}
+			}
+			it->release();
+		}
+	}
+	const uint32_t left = __atomic_load_n(&battLeft, __ATOMIC_ACQUIRE);
+	if (!left || !battRefresh) return;
+	for (uint32_t i = 0; i < batteryCount; i++)
+		batteries[i]->messageClients(kIOACPIMessageDeviceNotification, reinterpret_cast<void *>(static_cast<uintptr_t>(0x80)));
+	battNotifies++;
+	__atomic_store_n(&battLeft, left - 1, __ATOMIC_RELEASE);
+	if (left > 1) {
+		// Wake series: 5, 15, 30, 60 s after the wake (left 4, 3, 2, 1 → next gap 10, 15, 30).
+		static const uint32_t wakeGaps[] = {0, 30, 15, 10};
+		const uint32_t gap = __atomic_load_n(&battGap, __ATOMIC_ACQUIRE);
+		battSchedule(gap ? gap : wakeGaps[(left - 1) < 4 ? (left - 1) : 3]);
+	}
+}
+
 IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size_t) {
 	if ((type == kIOMessageSystemCapabilityChange || type == kIOMessageSystemWillPowerOn || type == kIOMessageSystemHasPoweredOn) &&
 	    userWakeCall && __atomic_exchange_n(&userWakePending, false, __ATOMIC_ACQ_REL)) {
@@ -760,6 +815,8 @@ IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size
 		clock_interval_to_deadline(500, kMillisecondScale, &deadline);
 		thread_call_enter_delayed(replayCall, deadline);
 	}
+	if (type == kIOMessageSystemWillSleep && battCall) { __atomic_store_n(&battLeft, 0U, __ATOMIC_RELEASE); thread_call_cancel(battCall); }
+	if (type == kIOMessageSystemHasPoweredOn) battStart(4, 0, 5);
 	if (type == kIOMessageSystemWillSleep && enabled == 1 && platformReady) __atomic_store_n(&shared.sleeping, 1U, __ATOMIC_RELEASE);
 	else if (type == kIOMessageSystemHasPoweredOn) __atomic_store_n(&shared.sleeping, 0U, __ATOMIC_RELEASE);
 	return kIOReturnSuccess;
@@ -848,6 +905,11 @@ int pmcHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		if (pmcHave) { put("start", pmcStart); put("end", pmcEnd); }
 	}
 	return sysctl_handle_string(oidp, pmcText, sizeof(pmcText), req);
+}
+int battHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
+	const int e = intHandler(o, &battRefresh, 0, 1, r);
+	if (!e && r->newptr && !battRefresh && battCall) { __atomic_store_n(&battLeft, 0U, __ATOMIC_RELEASE); thread_call_cancel(battCall); }
+	return e;
 }
 int safetyHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &safetySec, 0, 86400, r); }
 int gtHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
@@ -939,13 +1001,13 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u",
+		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
-		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors);
+		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies);
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -960,6 +1022,7 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC registers (live/start/end)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pciDiagHandler, "I", "1 = PCI power/link snapshot inside each sleep");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pciHandler, "A", "PCI D-state, ASPM, LTR enable and L1 substates (sleep/live)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, batt_refresh, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, battHandler, "I", "1 = battery re-read after wake and boot");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, safetyHandler, "I", "wake after N s (0 never)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, gtreset, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, gtHandler, "I", "1 = reset the Intel GT on wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_ignore, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, listHandler, "A", "EC events that do not wake (hex)");
@@ -990,6 +1053,9 @@ void S0ix::install(KernelPatcher &patcher) {
 		patcher.clearError();
 		userWakeCall = requestUserActive ? thread_call_allocate(userWakeWork, nullptr) : nullptr;
 		replayCall = thread_call_allocate(replayWork, nullptr);
+		battCall = thread_call_allocate(battWork, nullptr);
+		if (PE_parse_boot_argn("s0ixbatt", arg, sizeof(arg)) && arg[0] == '0') battRefresh = 0;
+		battStart(16, 15, 20);   // boot: every 15 s from 20 s to about 4 min
 		rdmsrCarefully = patcher.solveSymbol(KernelPatcher::KernelID, "_rdmsr_carefully");
 		patcher.clearError();
 		registerPrioritySleepWakeInterest(sleepInterest, nullptr, nullptr);
@@ -1009,6 +1075,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_pci_diag);
 	sysctl_register_oid(&sysctl__debug_s0ix_pci);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
+	sysctl_register_oid(&sysctl__debug_s0ix_batt_refresh);
 	sysctl_register_oid(&sysctl__debug_s0ix_gtreset);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_ignore);
 	sysctl_register_oid(&sysctl__debug_s0ix_ec_wake);

@@ -189,6 +189,16 @@ The settings are also sysctls (`debug.s0ix.ec_ignore`, `debug.s0ix.ec_wake`, `de
 `debug.s0ix.wait`, `debug.s0ix.period`, `debug.s0ix.gtreset`) and boot arguments (`s0ixecign=51,52`,
 `s0ixecwake=5e,5f`).
 
+### Battery reading after a wake
+
+Some embedded controllers report a wrong remaining capacity for a few seconds after a wake (and once about a
+minute after boot). The battery driver (SMCBatteryManager) reads the battery once a minute, so a reading taken in
+that window can stay on screen for a minute, or until the next wake if the machine went back to sleep. The kext
+therefore sends a battery notification (0x80) to the ACPI battery 5, 15, 30 and 60 s after each wake and every
+15 s during the first 4 minutes after boot, so the driver reads it again. `batt=` in the status shows
+enabled/batteries found/notifications sent; `debug.s0ix.batt_refresh=0` or the boot argument `s0ixbatt=0`
+turns it off.
+
 ### Package idle states
 
 `pc=` in the status is the share of the last sleep (per mille) the package spent in PC2, PC3, PC6, PC7,
