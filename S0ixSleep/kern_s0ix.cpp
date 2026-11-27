@@ -734,15 +734,16 @@ void ishWork(thread_call_param_t, thread_call_param_t) {
 // the 8254 lives in the ITSS, and a counting 8254 keeps the ITSS clock source request (LPM requirement "ITSS clock
 // source request" on Meteor Lake, an unnamed vnn_misc bit on Alder Lake) asserted, so the chipset cannot reach its low
 // power mode. macOS never uses the PIT once the TSC deadline timer runs, and with the HPET legacy replacement route set
-// its interrupt is not even delivered. Stopping it as Linux does (mode 0, count 0: one shot that ends) is harmless.
+// its interrupt is not even delivered. Stopping it as Linux does on real hardware (control word only) is harmless.
 int pitStop = 0;
 uint32_t pitStops = 0;
 uint8_t pitStatusBefore = 0xFF, pitStatusAfter = 0xFF;
 uint8_t pitStatus() { outb(0x43, 0xE2); return inb(0x40); }   // read-back command: status of counter 0
 void pitHalt() {
 	pitStatusBefore = pitStatus();
-	outb(0x43, 0x30);   // counter 0, lobyte/hibyte, mode 0 (interrupt on terminal count)
-	outb(0x40, 0); outb(0x40, 0);
+	// Counter 0, lobyte/hibyte, mode 0, and no count: writing the control word stops the counter until a count is
+	// written (Linux i8253 shutdown on real hardware; writing a zero count would start a new countdown).
+	outb(0x43, 0x30);
 	pitStatusAfter = pitStatus();
 	pitStops++;
 }
