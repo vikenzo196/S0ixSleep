@@ -129,7 +129,9 @@ daemon therefore watches every wake from s0ix sleep (all settings in `s0ixsleep.
   a few seconds after a wake, or `LOW_BATTERY_AWAKE` (4 %) at any time. A drained battery would otherwise
   end in a hard power loss.
 - **Bag guard** (`BAG_GUARD=60`): after a wake, if nobody touched the keyboard or trackpad and the display is
-  off for 60 s, back to sleep. `/var/run/s0ixsleep-keepawake` (removed at reboot) holds it off for remote work.
+  off for 60 s, back to sleep. Only on battery: on AC power it leaves the machine to macOS's own AC sleep setting
+  (`BAG_GUARD_AC=1` makes it act on AC too). `/var/run/s0ixsleep-keepawake` (removed at reboot) holds it off for
+  remote work.
 - **EC event replay** (`EC_REPLAY=1`): after a wake, the firmware's `_Qxx` methods of the EC events ignored
   during the sleep run once, so macOS sees battery and AC changes at once.
 - Optional `SLEEP_IF_DOWN=en0`: network interfaces down while the lid is closed and no display is on.

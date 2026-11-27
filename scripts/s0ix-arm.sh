@@ -12,6 +12,7 @@
 #    at or below LOW_BATTERY_AWAKE % at any time;
 #  - bag guard: after a wake, if nobody touched the keyboard or trackpad and the display is off for
 #    BAG_GUARD seconds, back to sleep (a wake nobody asked for must not keep the laptop running in a bag);
+#    on battery only, unless BAG_GUARD_AC=1;
 #  - network off while asleep: the interfaces in SLEEP_IF_DOWN go down while the lid is closed and no display
 #    is on (so not in clamshell mode with an external monitor), and come back when the lid opens or a display
 #    turns on. Off by default: on the tested machine (itlwm) it made no measurable difference.
@@ -35,7 +36,7 @@ fi
 
 # Configuration: KEY=value lines, see s0ixsleep.conf.
 WAIT=2; PERIOD=50; SAFETY=3600; GT_RESET=0; EC_IGNORE=; EC_WAKE=; EC_REPLAY=1; WAKE_GPE=; LID_EC=
-LOW_BATTERY_SLEEP=10; LOW_BATTERY_AWAKE=4; BAG_GUARD=60; SLEEP_IF_DOWN=; SLEEP_L12=; AWAKE_L12=0
+LOW_BATTERY_SLEEP=10; LOW_BATTERY_AWAKE=4; BAG_GUARD=60; BAG_GUARD_AC=0; SLEEP_IF_DOWN=; SLEEP_L12=; AWAKE_L12=0
 [ -f "$CONF" ] && . "$CONF"
 sysctl -w debug.s0ix.period="$PERIOD" >/dev/null
 if ! sysctl -w debug.s0ix.wait="$WAIT" >/dev/null 2>&1; then
@@ -164,8 +165,15 @@ while :; do
     # Input in the first 10 s belongs to the wake itself (key, lid, or the event that woke it).
     if [ -n "$idle_s" ] && [ "$since" -ge 10 ] && [ "$idle_s" -lt $((since - 10)) ]; then guard=0   # in use
     elif [ "$since" -ge "$BAG_GUARD" ] && ! display_on; then
-      guard=0; log "bag guard: no input for $since s since the wake, display off: back to sleep"
-      pmset sleepnow >/dev/null
+      guard=0
+      # On AC power (a laptop on a charger is rarely in a bag) the guard leaves the machine to macOS's own AC sleep
+      # setting, unless BAG_GUARD_AC=1.
+      if [ "$BAG_GUARD_AC" != 1 ] && [ "$(battery | cut -d' ' -f2)" = AC ]; then
+        log "bag guard: no input for $since s since the wake, but on AC power: left to macOS"
+      else
+        log "bag guard: no input for $since s since the wake, display off: back to sleep"
+        pmset sleepnow >/dev/null
+      fi
     fi
   fi
 done
