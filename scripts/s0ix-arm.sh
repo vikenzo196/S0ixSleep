@@ -153,7 +153,7 @@ while :; do
   s=$(field sleeps)
   if [ -n "$s" ] && [ "$s" != "$last" ]; then
     last=$s; woke=$(date +%s); checked=0; guard=1
-    log "wake $s: reason $(field reason), $(field ms) ms, package $(field pkg_mw) mW, EC $(field ec_q), replayed $(field replayed); battery $(battery | cut -d" " -f1)% ($(battery_raw))"
+    log "wake $s: reason $(field reason), $(field ms) ms, package $(field pkg_mw) mW, platform $(field psys_mw) mW, EC $(field ec_q), replayed $(field replayed); battery $(battery | cut -d" " -f1)% ($(battery_raw))"
   fi
   [ "$woke" = 0 ] && continue
   since=$(( $(date +%s) - woke ))

@@ -160,7 +160,7 @@ typedef void (*AcpiSleepCallback)(void *);
 mach_vm_address_t orgAcpiSleep = 0, requestUserActive = 0;
 int route = 0;
 uint32_t lastReason = 0, ecIgnored = 0, ecLast[4] = {0x1FF, 0x1FF, 0x1FF, 0x1FF}, userWakes = 0, gtResult = 0;
-uint64_t lastLoops = 0, lastMs = 0, lastPkgMw = 0, lastCoreMw = 0, lastHwp = 0;
+uint64_t lastLoops = 0, lastMs = 0, lastPkgMw = 0, lastCoreMw = 0, lastHwp = 0, lastPsysMw = 0;
 uint32_t lastMwait = 0;   // 1 = last wait used MWAIT, 2 = asked for but not entered (see mwait_fail)
 uint8_t gpeEn[MaxGpeBytes], gpeStsStart[MaxGpeBytes], gpeStsEnd[MaxGpeBytes];
 volatile bool userWakePending = false;
@@ -621,7 +621,6 @@ constexpr uint16_t IshIds[] = {0x0AA2, 0x1AA2, 0x5AA2, 0x9D35, 0x9DFC, 0x31A2, 0
 	0x4BB3, 0xA0FC, 0x43FC, 0x7AF8, 0x51FC, 0x54FC, 0x7A78};
 constexpr unsigned IshFwSts = 0x34, IshHostComm = 0x38, IshH2iDrbl = 0x48, IshI2hDrbl = 0x54, IshI2hMsg = 0x60,
 	IshH2iMsg = 0xE0, IshRmp2 = 0x368;
-IOPCIDevice *ishDev = nullptr;
 IOMemoryMap *ishMap = nullptr;
 volatile uint8_t *ishMmio = nullptr;
 int ishWake = 0;
@@ -636,34 +635,53 @@ bool ishSendMng(uint32_t cmd, uint32_t payload) {
 	ishWr(IshH2iDrbl, 0x80000000U | (3U << 10) | (cmd << 16) | 4U);   // busy, protocol MNG, command, 4 bytes
 	return true;
 }
+// Config space and BAR are reached directly (ECAM, physical BAR): IOPCIFamily puts the driverless ISH in D3 with memory
+// decoding off at boot, and its config accessors do not bring it back for a client that is not its driver.
+volatile uint8_t *ishCfg = nullptr;
+IOMemoryMap *ishCfgMap = nullptr;
+uint16_t ishPm = 0;
+bool ishUp = false;
+uint32_t ishCfg32(unsigned off) { return rd32(ishCfg, off); }
+void ishCfgWr16(unsigned off, uint16_t v) { *reinterpret_cast<volatile uint16_t *>(ishCfg + off) = v; }
+bool ishFind() {
+	if (ishCfg) return true;
+	uint64_t ecam = 0;
+	if (OSNumber *n = OSDynamicCast(OSNumber, IOService::getPlatform() ? IOService::getPlatform()->getProperty("acpi-mmcfg-seg0") : nullptr))
+		ecam = n->unsigned64BitValue();
+	if (!ecam || (ecam & 0xFFFFF)) return false;
+	for (uint16_t dev = 0; dev < 32 && !ishCfg; dev++) {
+		IOMemoryMap *m = nullptr;
+		volatile uint8_t *c = ecamMap(ecam, (uint16_t)(dev << 3), &m);
+		if (!c) continue;
+		const uint32_t id = rd32(c, 0);
+		bool match = (id & 0xFFFF) == 0x8086;
+		if (match) { match = false; for (uint16_t k : IshIds) if (k == (id >> 16)) match = true; }
+		if (!match) { m->release(); continue; }
+		ishCfg = c; ishCfgMap = m;
+		ishPm = findCap(c, 0x01);
+	}
+	if (!ishCfg || !ishPm) return false;
+	const uint64_t bar = ((uint64_t)ishCfg32(0x14) << 32) | (ishCfg32(0x10) & ~0xFULL);
+	if (!bar || (ishCfg32(0x10) & 1)) return false;
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(bar, 4096, kIODirectionInOut);
+	ishMap = md ? md->map(kIOMapInhibitCache) : nullptr;
+	if (md) md->release();
+	if (!ishMap) return false;
+	ishMmio = reinterpret_cast<volatile uint8_t *>(ishMap->getVirtualAddress());
+	return true;
+}
+void ishPowerUp() {
+	if ((ishCfg32(ishPm + 4) & 3) != 0) { ishCfgWr16(ishPm + 4, (uint16_t)(ishCfg32(ishPm + 4) & ~3U)); IOSleep(10); }
+	ishCfgWr16(0x04, (uint16_t)(ishCfg32(0x04) | 0x6));   // memory space + bus master
+}
 // Thread context only (sleeps). Returns true when the firmware reports ILUP + ISHTP ready.
 bool ishHandshake() {
-	if (!ishDev) {
-		OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
-		while (it && !ishDev) {
-			OSObject *o = it->getNextObject();
-			if (!o) break;
-			IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
-			if (!d || d->configRead16(0) != 0x8086 || d->getBusNumber() != 0) continue;
-			const uint16_t id = d->configRead16(2);
-			for (uint16_t k : IshIds) if (k == id) { ishDev = d; d->retain(); break; }
-		}
-		if (it) it->release();
-		if (!ishDev) return false;
-	}
+	if (!ishFind()) return false;
 	ishRuns++;
-	uint8_t pm = 0;
-	ishDev->findPCICapability(kIOPCIPowerManagementCapability, &pm);
-	if (pm && (ishDev->configRead16(pm + 4) & 3)) { ishDev->configWrite16(pm + 4, (uint16_t)(ishDev->configRead16(pm + 4) & ~3U)); IOSleep(10); }
-	ishDev->setMemoryEnable(true);
-	ishDev->setBusMasterEnable(true);
-	if (!ishMap) {
-		ishMap = ishDev->mapDeviceMemoryWithIndex(0);
-		if (!ishMap) return false;
-		ishMmio = reinterpret_cast<volatile uint8_t *>(ishMap->getVirtualAddress());
-	}
+	ishPowerUp();
 	ishLast = ishRd(IshFwSts);
-	if ((ishLast & 3) == 3) { ishOk++; return true; }   // already up
+	if (ishLast == 0xFFFFFFFFU) { ishUp = false; return false; }
+	if ((ishLast & 3) == 3 && (ishRd(IshHostComm) & 0x80)) { ishUp = true; ishOk++; return true; }   // already up
 	ishWr(IshHostComm, ishRd(IshHostComm) | 0x80);         // host ready
 	ishWr(IshRmp2, 1);                                      // DMA enabled
 	ishWr(IshI2hDrbl, 0);
@@ -679,7 +697,7 @@ bool ishHandshake() {
 			ishWr(IshI2hDrbl, 0);
 		}
 		ishLast = ishRd(IshFwSts);
-		if ((ishLast & 3) == 3) break;
+		if (ishLast != 0xFFFFFFFFU && (ishLast & 3) == 3) break;
 		IOSleep(10);
 	}
 	for (unsigned i = 0; i < 20; i++) {   // the completion indication of our ACK
@@ -687,11 +705,30 @@ bool ishHandshake() {
 		IOSleep(10);
 	}
 	ishLast = ishRd(IshFwSts);
-	if ((ishLast & 3) != 3) return false;
+	if (ishLast == 0xFFFFFFFFU || (ishLast & 3) != 3) { ishUp = false; return false; }
+	ishUp = true;
 	ishOk++;
 	return true;
 }
-void ishWork(thread_call_param_t, thread_call_param_t) { if (ishWake) ishHandshake(); }
+// Shutdown and restart: as Linux ish_shutdown, DMA off and host not ready before D3, so that the firmware is not left
+// waiting on a host that is gone (it then ignored the next boot's handshake).
+void ishShutdown() {
+	if (!ishUp || !ishMmio || !ishCfg) return;
+	ishWr(IshRmp2, 0);
+	for (unsigned i = 0; i < 20 && (ishRd(IshFwSts) & 0xF0000U); i++) IODelay(5000);
+	ishWr(IshHostComm, ishRd(IshHostComm) & ~0x80U);
+	ishCfgWr16(ishPm + 4, (uint16_t)((ishCfg32(ishPm + 4) & ~3U) | 3U));
+	ishUp = false;
+}
+uint32_t ishChecks = 0;
+// Re-check: after the call that enabled it (IOPCIFamily may still power the device down), and after each wake.
+void ishWork(thread_call_param_t, thread_call_param_t) {
+	if (!ishWake) return;
+	ishChecks++;
+	if (!ishFind()) return;
+	const uint32_t f = (ishCfg32(ishPm + 4) & 3) == 0 && (ishCfg32(0x04) & 2) ? ishRd(IshFwSts) : 0xFFFFFFFFU;
+	if (f == 0xFFFFFFFFU || (f & 3) != 3) ishHandshake();
+}
 
 // ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
 constexpr uint8_t TimerVector = 0xF2, SpuriousVector = 0xFF;
@@ -705,7 +742,7 @@ uint64_t apicFound = 0, coreC7Ms = 0;
 mach_vm_address_t rdmsrCarefully = 0;
 // Package C-state residency: PC2 PC3 PC6 PC7 PC8 PC9 PC10, probed with rdmsr_carefully.
 constexpr uint32_t ResMsr[7] = {0x60D, 0x3F8, 0x3F9, 0x3FA, 0x630, 0x631, 0x632};
-uint32_t resOk = 0, resPm[7];   // bits 0-6 ResMsr, 7 core C7 residency 0x3FE, 31 probed
+uint32_t resOk = 0, resPm[7];   // bits 0-6 ResMsr, 7 core C7 residency 0x3FE, 8 platform energy 0x64D, 31 probed
 
 struct __attribute__((packed)) Idtr { uint16_t limit; uint64_t base; };
 struct ApicSave { Idtr idt; uint64_t base, deadline; uint32_t svr, lvt, tpr; };
@@ -729,6 +766,7 @@ void probeResidency() {
 	if (intel == 1) {
 		for (unsigned i = 0; i < 7; i++) if (rd(ResMsr[i], &lo, &hi) == 0) ok |= 1U << i;
 		if (rd(0x3FE, &lo, &hi) == 0) ok |= 1U << 7;
+		if (rd(0x64D, &lo, &hi) == 0) ok |= 1U << 8;   // MSR_PLATFORM_ENERGY_COUNTER (Psys), same units as RAPL
 	}
 	resOk = ok;
 }
@@ -833,6 +871,8 @@ void s0ixWait(void *) {
 	const uint64_t safety = safetySec > 0 && tpms ? (uint64_t)safetySec * 1000ULL * tpms : 0;
 	const bool rapl = intel == 1;
 	const uint64_t e0 = rapl ? rdmsr(MsrPkgEnergy) & 0xFFFFFFFFULL : 0, c0 = rapl ? rdmsr(MsrPp0Energy) & 0xFFFFFFFFULL : 0;
+	const bool psys = rapl && (resOk & (1U << 8));
+	const uint64_t s0 = psys ? rdmsr(0x64D) & 0xFFFFFFFFULL : 0;
 	uint64_t hwp = 0;
 	bool hwpSet = false;
 	if (wait >= 1 && hwpCap && (rdmsr(MsrPmEnable) & 1)) {
@@ -946,6 +986,7 @@ void s0ixWait(void *) {
 			const uint32_t esu = (uint32_t)(rdmsr(MsrRaplPowerUnit) >> 8) & 0x1F;
 			// mW = (counts / 2^esu J) / (ms / 1000 s) * 1000
 			lastPkgMw = (((e1 - e0) & 0xFFFFFFFFULL) * 1000000ULL >> esu) / ms;
+			lastPsysMw = psys ? ((((rdmsr(0x64D) & 0xFFFFFFFFULL) - s0) & 0xFFFFFFFFULL) * 1000000ULL >> esu) / ms : 0;
 			lastCoreMw = (((c1 - c0) & 0xFFFFFFFFULL) * 1000000ULL >> esu) / ms;
 		} else lastPkgMw = lastCoreMw = 0;
 	}
@@ -1048,6 +1089,7 @@ IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size
 		clock_interval_to_deadline(500, kMillisecondScale, &deadline);
 		thread_call_enter_delayed(replayCall, deadline);
 	}
+	if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) ishShutdown();
 	if (type == kIOMessageSystemWillSleep && battCall) { __atomic_store_n(&battLeft, 0U, __ATOMIC_RELEASE); thread_call_cancel(battCall); }
 	if (type == kIOMessageSystemHasPoweredOn) battStart(4, 0, 5);
 	if (type == kIOMessageSystemHasPoweredOn && ishWake && ishCall) {
@@ -1137,8 +1179,14 @@ int ishHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	if (error || !req->newptr) return error;
 	if (value != 0 && value != 1) return EINVAL;
 	ishWake = value;
-	if (value && !ishHandshake()) return EIO;
-	return 0;
+	if (!value) return 0;
+	const bool ok = ishHandshake();
+	if (ishCall) {   // look again in 30 s
+		uint64_t deadline;
+		clock_interval_to_deadline(30, kSecondScale, &deadline);
+		thread_call_enter_delayed(ishCall, deadline);
+	}
+	return ok ? 0 : EIO;
 }
 int periodHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &periodMs, 5, 1000, r); }
 int replayHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &ecReplay, 0, 1, r); }
@@ -1400,12 +1448,12 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	}
 	snprintf(statText, sizeof(statText),
 		"route=%d enable=%d platform=%d lps0=%d pm1=0x%x gpe0=0x%x/%u ec=0x%x/0x%x ecgpe=%d kbc=%d intel=%d hwp_cap=%d waitpkg=%d tsc_ms=%llu"
-		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
+		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu psys_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
 		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u l12=%u/%u/%u ish=%d/%u/%u/0x%x",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
-		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
+		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastPsysMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
