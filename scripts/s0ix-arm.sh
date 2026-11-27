@@ -35,7 +35,7 @@ fi
 
 # Configuration: KEY=value lines, see s0ixsleep.conf.
 WAIT=2; PERIOD=50; SAFETY=3600; GT_RESET=0; EC_IGNORE=; EC_WAKE=; EC_REPLAY=1; WAKE_GPE=; LID_EC=
-LOW_BATTERY_SLEEP=10; LOW_BATTERY_AWAKE=4; BAG_GUARD=60; SLEEP_IF_DOWN=
+LOW_BATTERY_SLEEP=10; LOW_BATTERY_AWAKE=4; BAG_GUARD=60; SLEEP_IF_DOWN=; SLEEP_L12=
 [ -f "$CONF" ] && . "$CONF"
 sysctl -w debug.s0ix.period="$PERIOD" >/dev/null
 if ! sysctl -w debug.s0ix.wait="$WAIT" >/dev/null 2>&1; then
@@ -49,6 +49,10 @@ sysctl -w debug.s0ix.ec_replay="$EC_REPLAY" >/dev/null 2>&1
 [ -n "$EC_WAKE" ] && sysctl -w debug.s0ix.ec_wake="$EC_WAKE" >/dev/null
 [ -n "$WAKE_GPE" ] && sysctl -w debug.s0ix.wake_gpe="$WAKE_GPE" >/dev/null 2>&1
 [ -n "$LID_EC" ] && sysctl -w debug.s0ix.lid_ec="$LID_EC" >/dev/null 2>&1
+if [ -n "$SLEEP_L12" ]; then
+  if sysctl -w debug.s0ix.l12="$SLEEP_L12" >/dev/null 2>&1; then log "PCI-PM L1.2 in sleep on $SLEEP_L12"
+  else log "SLEEP_L12=$SLEEP_L12 refused (no such root port, no device behind it, or no L1.2 support on both ends)"; fi
+fi
 
 # Hibernation and standby would take another path to S3/S4.
 pmset -a hibernatemode 0 standby 0 autopoweroff 0 >/dev/null 2>&1

@@ -503,6 +503,112 @@ volatile uint32_t *mapDword(uint64_t phys, IOMemoryMap **out) {
 	return reinterpret_cast<volatile uint32_t *>(m->getVirtualAddress() + (phys & 0xFFC));
 }
 
+// PCI-PM L1.2 in sleep (debug.s0ix.l12, SLEEP_L12 in s0ixsleep.conf). A PCIe link whose downstream device sits in D3hot
+// during the sleep stays in L1 with its reference clock request asserted unless L1 PM Substates are enabled, and an
+// active clock request on a CPU root port keeps the package out of PC6 and deeper (on the tested machine the NVMe link
+// alone held it in PC3: ~1.5 W, PC10 never; with L1.2 in sleep ~0.3 W, PC10 87%). macOS never programs L1 PM Substates,
+// so the kext enables PCI-PM L1.2 on the listed root ports and their devices inside the wait, with the timing values
+// Linux computes (aspm_calc_l12_info), and puts the registers back before the wake hooks. Only when the device is in
+// D3hot at that point. Opt-in per root port: the board must route the CLKREQ# of that slot.
+constexpr unsigned L12Max = 4;
+struct L12Link {
+	uint16_t port, dev, portL1ss, devL1ss, devPm;
+	volatile uint8_t *pcfg, *dcfg;
+	IOMemoryMap *pmap, *dmap;
+	uint32_t ctl1Port, ctl1Dev, ctl2, saved[4];
+	bool active;
+};
+L12Link l12[L12Max];
+unsigned l12Count = 0;
+uint32_t l12Applied = 0, l12Skipped = 0;
+char l12Text[64] = "";
+volatile uint8_t *ecamMap(uint64_t ecam, uint16_t bdf, IOMemoryMap **out) {
+	*out = nullptr;
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(ecam + ((uint64_t)bdf << 12), 4096, kIODirectionInOut);
+	IOMemoryMap *m = md ? md->map(kIOMapInhibitCache) : nullptr;
+	if (md) md->release();
+	if (!m || !m->getVirtualAddress()) { if (m) m->release(); return nullptr; }
+	*out = m;
+	return reinterpret_cast<volatile uint8_t *>(m->getVirtualAddress());
+}
+uint16_t findCap(volatile uint8_t *cfg, uint8_t id) {
+	if (!(rd32(cfg, 4) & (1U << 20))) return 0;
+	uint8_t p = (uint8_t)(rd32(cfg, 0x34) & 0xFC);
+	for (unsigned n = 0; p && n < 48; n++) {
+		const uint32_t v = rd32(cfg, p);
+		if ((v & 0xFF) == id) return p;
+		p = (uint8_t)((v >> 8) & 0xFC);
+	}
+	return 0;
+}
+uint16_t findExtCap(volatile uint8_t *cfg, uint16_t id) {
+	uint16_t p = 0x100;
+	for (unsigned n = 0; p >= 0x100 && n < 64; n++) {
+		const uint32_t v = rd32(cfg, p);
+		if (v == 0 || v == 0xFFFFFFFFU) return 0;
+		if ((v & 0xFFFF) == id) return p;
+		p = (uint16_t)((v >> 20) & 0xFFC);
+	}
+	return 0;
+}
+uint32_t tPowerOnUs(uint32_t cap) {
+	static const uint32_t scaleUs[] = {2, 10, 100, 0};
+	return scaleUs[(cap >> 16) & 3] * ((cap >> 19) & 0x1F);
+}
+// Sets up one root port "bb:dd.f": device 0 of its secondary bus, both with PCI-PM L1.2 and L1 PM Substates.
+int l12Prepare(uint64_t ecam, uint16_t portBdf, L12Link &l) {
+	l = {};
+	l.port = portBdf;
+	if (!(l.pcfg = ecamMap(ecam, portBdf, &l.pmap))) return ENOENT;
+	const uint32_t bus = (rd32(l.pcfg, 0x18) >> 8) & 0xFF;
+	if ((rd32(l.pcfg, 0x0C) & 0x7F0000) != 0x010000 || !bus) return ENODEV;   // not a bridge, or no secondary bus
+	l.dev = (uint16_t)(bus << 8);
+	if (!(l.dcfg = ecamMap(ecam, l.dev, &l.dmap)) || rd32(l.dcfg, 0) == 0xFFFFFFFFU) return ENODEV;
+	l.portL1ss = findExtCap(l.pcfg, 0x1E);
+	l.devL1ss = findExtCap(l.dcfg, 0x1E);
+	l.devPm = findCap(l.dcfg, 0x01);
+	if (!l.portL1ss || !l.devL1ss || !l.devPm) return ENOTSUP;
+	const uint32_t pc = rd32(l.pcfg, l.portL1ss + 4), dc = rd32(l.dcfg, l.devL1ss + 4);
+	if (!(pc & dc & 0x01) || !(pc & dc & 0x10)) return ENOTSUP;   // PCI-PM L1.2 and L1 PM Substates on both ends
+	// As Linux aspm_calc_l12_info: the larger Common_Mode_Restore_Time and T_POWER_ON of the two ends, and
+	// LTR_L1.2_THRESHOLD = 2 us (T(POWER_OFF)) + 4 us (T(L1.2)) + Common_Mode_Restore_Time.
+	const uint32_t cmrt = ((pc >> 8) & 0xFF) > ((dc >> 8) & 0xFF) ? ((pc >> 8) & 0xFF) : ((dc >> 8) & 0xFF);
+	const uint32_t tpo = tPowerOnUs(pc) >= tPowerOnUs(dc) ? pc : dc;
+	l.ctl2 = (((tpo >> 19) & 0x1F) << 3) | ((tpo >> 16) & 3);
+	const uint64_t ns = (2ULL + 4ULL + cmrt) * 1000ULL;
+	uint32_t scale = 0, value = (uint32_t)ns;
+	for (uint64_t unit = 1; scale < 5 && ns > unit * 0x3FF; ) { scale++; unit = scale == 1 ? 32 : scale == 2 ? 1024 : scale == 3 ? 32768 : scale == 4 ? 1048576 : 33554432; value = (uint32_t)((ns + unit - 1) / unit); }
+	const uint32_t th = (scale << 29) | ((value & 0x3FF) << 16);
+	l.ctl1Port = th | (cmrt << 8) | 0x01;
+	l.ctl1Dev = th | 0x01;
+	return 0;
+}
+void l12Apply() {
+	for (unsigned i = 0; i < l12Count; i++) {
+		L12Link &l = l12[i];
+		l.active = false;
+		if ((rd32(l.dcfg, l.devPm + 4) & 3) != 3) { l12Skipped++; continue; }   // device not in D3hot: leave the link alone
+		volatile uint32_t *p1 = reinterpret_cast<volatile uint32_t *>(l.pcfg + l.portL1ss + 8), *p2 = p1 + 1;
+		volatile uint32_t *d1 = reinterpret_cast<volatile uint32_t *>(l.dcfg + l.devL1ss + 8), *d2 = d1 + 1;
+		l.saved[0] = *p1; l.saved[1] = *p2; l.saved[2] = *d1; l.saved[3] = *d2;
+		*p2 = l.ctl2; *d2 = l.ctl2;                 // T_POWER_ON, upstream end first
+		*p1 = l.ctl1Port; *d1 = l.ctl1Dev;          // thresholds and PCI-PM L1.2 enable, upstream end first
+		l.active = true;
+		l12Applied++;
+	}
+}
+void l12Restore() {
+	for (unsigned i = l12Count; i-- > 0;) {
+		L12Link &l = l12[i];
+		if (!l.active) continue;
+		volatile uint32_t *p1 = reinterpret_cast<volatile uint32_t *>(l.pcfg + l.portL1ss + 8), *p2 = p1 + 1;
+		volatile uint32_t *d1 = reinterpret_cast<volatile uint32_t *>(l.dcfg + l.devL1ss + 8), *d2 = d1 + 1;
+		*d1 = l.saved[2]; *p1 = l.saved[0];         // disable, downstream end first (wakes the link out of L1.2)
+		*d2 = l.saved[3]; *p2 = l.saved[1];
+		l.active = false;
+	}
+}
+
 // ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
 constexpr uint8_t TimerVector = 0xF2, SpuriousVector = 0xFF;
 alignas(4096) uint8_t idtCopy[4096];
@@ -621,6 +727,7 @@ void leaveMwait(const ApicSave &s) {
 // ─── the wait ───────────────────────────────────────────────────────────────────────────────────
 void s0ixWait(void *) {
 	runHooks(S0ixHookEnter, 0);
+	l12Apply();
 	cfgwApply();
 	if (pciDiag && pciCount) { pciSnapshot(pciSleep); pciSnaps++; }
 	uint8_t snap[MaxGpeBytes], extra[MaxGpeBytes];
@@ -760,6 +867,7 @@ void s0ixWait(void *) {
 	}
 	if (reason == 1) outw(pm1Sts, Pm1PwrBtn);
 	cfgwRestore();
+	l12Restore();
 	if (gtReset && gtMmio) resetGt();   // legacy option; graphics kexts should do this from a hook
 	runHooks(S0ixHookExit, reason);
 	lastReason = reason;
@@ -896,6 +1004,43 @@ int waitHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	}
 	waitMode = value;
 	return 0;
+}
+uint64_t hexField64(const char *&p, const char *stops);
+int l12Set(const char *text) {
+	if (__atomic_load_n(&shared.sleeping, __ATOMIC_ACQUIRE)) return EBUSY;
+	uint64_t ecam = 0;
+	if (OSNumber *n = OSDynamicCast(OSNumber, IOService::getPlatform() ? IOService::getPlatform()->getProperty("acpi-mmcfg-seg0") : nullptr))
+		ecam = n->unsigned64BitValue();
+	if (*text && (!ecam || (ecam & 0xFFFFF))) return ENODEV;
+	L12Link parsed[L12Max];
+	unsigned count = 0;
+	int err = 0;
+	for (const char *p = text; *p && count < L12Max && !err;) {
+		const uint64_t bus = hexField64(p, ":"); if (*p == ':') p++;
+		const uint64_t dev = hexField64(p, "."); if (*p == '.') p++;
+		const uint64_t fn = hexField64(p, ","); if (*p == ',') p++;
+		if (bus > 0xFF || dev > 0x1F || fn > 7) { err = EINVAL; break; }
+		err = l12Prepare(ecam, (uint16_t)((bus << 8) | (dev << 3) | fn), parsed[count]);
+		if (err) { if (parsed[count].pmap) parsed[count].pmap->release(); if (parsed[count].dmap) parsed[count].dmap->release(); }
+		else count++;
+	}
+	if (err) { for (unsigned j = 0; j < count; j++) { parsed[j].pmap->release(); parsed[j].dmap->release(); } return err; }
+	L12Link old[L12Max];
+	const unsigned oldCount = l12Count;
+	for (unsigned i = 0; i < oldCount; i++) old[i] = l12[i];
+	l12Count = 0;
+	for (unsigned i = 0; i < count; i++) l12[i] = parsed[i];
+	l12Count = count;
+	for (unsigned i = 0; i < oldCount; i++) { old[i].pmap->release(); old[i].dmap->release(); }
+	strlcpy(l12Text, text, sizeof(l12Text));
+	return 0;
+}
+int l12Handler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	char buf[sizeof(l12Text)];
+	strlcpy(buf, l12Text, sizeof(buf));
+	const int error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error || !req->newptr) return error;
+	return l12Set(buf);
 }
 int periodHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &periodMs, 5, 1000, r); }
 int replayHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &ecReplay, 0, 1, r); }
@@ -1150,13 +1295,13 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u",
+		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u l12=%u/%u/%u",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
-		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, cfgwCount, cfgwApplied);
+		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, cfgwCount, cfgwApplied, l12Count, l12Applied, l12Skipped);
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -1171,6 +1316,7 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC registers (live/start/end)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pciDiagHandler, "I", "1 = PCI power/link snapshot inside each sleep");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgw, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, cfgwHandler, "A", "register writes/reads inside the wait: bb:dd.f:off or mADDR, =value/mask to write (hex)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, l12, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, l12Handler, "A", "root ports whose link goes to PCI-PM L1.2 in sleep: bb:dd.f,... (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgr, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, cfgrHandler, "A", "cfgw entries: values before, at the start and at the end of the last wait");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, mmio, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, mmioHandler, "A", "physical dword: ADDR selects, ADDR=value/mask writes now (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pciHandler, "A", "PCI D-state, ASPM, LTR enable and L1 substates (sleep/live)");
@@ -1228,6 +1374,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_pci);
 	sysctl_register_oid(&sysctl__debug_s0ix_cfgw);
 	sysctl_register_oid(&sysctl__debug_s0ix_cfgr);
+	sysctl_register_oid(&sysctl__debug_s0ix_l12);
 	sysctl_register_oid(&sysctl__debug_s0ix_mmio);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_batt_refresh);

@@ -199,6 +199,17 @@ therefore sends a battery notification (0x80) to the ACPI battery 5, 15, 30 and 
 enabled/batteries found/notifications sent; `debug.s0ix.batt_refresh=0` or the boot argument `s0ixbatt=0`
 turns it off.
 
+### PCIe L1.2 in sleep
+
+macOS never enables PCIe L1 PM Substates. A link that stays in plain L1 while its device sleeps in D3hot keeps
+the reference clock request asserted, and on a CPU root port that is enough to hold the package in PC3. On the
+tested machine the NVMe SSD on the CPU root port 00:06.0 alone kept the package at ~1.5 W in PC3 during sleep;
+with `SLEEP_L12=00:06.0` the package sleeps at ~0.3 W, 87% of the time in PC10. The kext enables PCI-PM L1.2 on the
+listed root ports and their devices inside the wait, with the timing values Linux computes (T_POWER_ON and
+Common_Mode_Restore_Time of the slower end, LTR_L1.2_THRESHOLD), only if the device is in D3hot, and restores the
+registers before the wake hooks. `l12=` in the status shows links/applied/skipped. The board must route CLKREQ#
+for the slot; if a sleep with it does not wake, remove the setting.
+
 ### Package idle states
 
 `pc=` in the status is the share of the last sleep (per mille) the package spent in PC2, PC3, PC6, PC7,
