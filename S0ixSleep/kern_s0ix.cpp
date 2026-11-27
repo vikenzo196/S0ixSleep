@@ -464,29 +464,43 @@ void preparePci() {
 	it->release();
 }
 
-// Sleep-time config writes (debug.s0ix.cfgw, for experiments): PCI config dwords changed inside the wait, after
-// every driver and hook has run, and put back before the wake hooks. "bb:dd.f:off=value/mask,..." (hex): the bits in
-// mask take value. Used to find out which PCH function keeps the package awake without touching its driver.
-constexpr unsigned CfgwMax = 8;
-struct Cfgw { uint16_t bdf, off; uint32_t value, mask, saved; volatile uint8_t *cfg; IOMemoryMap *map; };
+// Sleep-time register writes and reads (debug.s0ix.cfgw, for experiments): PCI config dwords ("bb:dd.f:off") or
+// physical MMIO dwords ("mADDR"), changed inside the wait after every driver and hook has run and put back before the
+// wake hooks. An entry with "=value/mask" writes (the bits in mask take value); an entry without only reads, at the
+// start and at the end of the wait (debug.s0ix.cfgr). Used to find the PCH function that keeps the package awake
+// without touching its driver.
+constexpr unsigned CfgwMax = 12;
+struct Cfgw { bool write; uint32_t value, mask, saved, atEnter, atExit; volatile uint32_t *reg; IOMemoryMap *map; char label[24]; };
 Cfgw cfgw[CfgwMax];
 unsigned cfgwCount = 0;
 uint32_t cfgwApplied = 0;
-char cfgwText[160] = "";
+bool cfgwAnyWrite = false;
+char cfgwText[256] = "";
 void cfgwApply() {
 	for (unsigned i = 0; i < cfgwCount; i++) {
-		volatile uint32_t *r = reinterpret_cast<volatile uint32_t *>(cfgw[i].cfg + cfgw[i].off);
-		cfgw[i].saved = *r;
-		*r = (cfgw[i].saved & ~cfgw[i].mask) | (cfgw[i].value & cfgw[i].mask);
+		Cfgw &c = cfgw[i];
+		if (c.write) { c.saved = *c.reg; *c.reg = (c.saved & ~c.mask) | (c.value & c.mask); }
+		c.atEnter = *c.reg;
 	}
 	if (cfgwCount) cfgwApplied++;
 }
 void cfgwRestore() {
 	for (unsigned i = cfgwCount; i-- > 0;) {
-		volatile uint32_t *r = reinterpret_cast<volatile uint32_t *>(cfgw[i].cfg + cfgw[i].off);
-		*r = cfgw[i].saved;
+		Cfgw &c = cfgw[i];
+		c.atExit = *c.reg;
+		if (c.write) *c.reg = c.saved;
 	}
-	if (cfgwCount) IODelay(10000);   // D3hot → D0 needs 10 ms before the function is touched again
+	if (cfgwAnyWrite) IODelay(10000);   // D3hot → D0 needs 10 ms before the function is touched again
+}
+// One uncached mapping of the page holding a physical dword.
+volatile uint32_t *mapDword(uint64_t phys, IOMemoryMap **out) {
+	*out = nullptr;
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(phys & ~0xFFFULL, 4096, kIODirectionInOut);
+	IOMemoryMap *m = md ? md->map(kIOMapInhibitCache) : nullptr;
+	if (md) md->release();
+	if (!m || !m->getVirtualAddress()) { if (m) m->release(); return nullptr; }
+	*out = m;
+	return reinterpret_cast<volatile uint32_t *>(m->getVirtualAddress() + (phys & 0xFFC));
 }
 
 // ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
@@ -890,13 +904,13 @@ int pmcDiagHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
 	if (!error && r->newptr && pmcDiag && platformReady) preparePmc();
 	return error;
 }
-uint32_t hexField(const char *&p, char stop) {
-	uint32_t v = 0;
-	while (*p && *p != stop) {
+bool isStop(char c, const char *stops) { for (; *stops; stops++) if (*stops == c) return true; return false; }
+uint64_t hexField64(const char *&p, const char *stops) {
+	uint64_t v = 0;
+	while (*p && !isStop(*p, stops)) {
 		const char c = *p++;
-		v = (v << 4) | (uint32_t)(c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 0);
+		v = (v << 4) | (uint64_t)(c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 0);
 	}
-	if (*p == stop) p++;
 	return v;
 }
 int cfgwHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
@@ -908,40 +922,94 @@ int cfgwHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 	uint64_t ecam = 0;
 	if (OSNumber *n = OSDynamicCast(OSNumber, IOService::getPlatform() ? IOService::getPlatform()->getProperty("acpi-mmcfg-seg0") : nullptr))
 		ecam = n->unsigned64BitValue();
-	if (!ecam || (ecam & 0xFFFFF)) return ENODEV;
 	Cfgw parsed[CfgwMax] {};
 	unsigned count = 0;
-	for (const char *p = buf; *p && count < CfgwMax;) {
+	int err = 0;
+	for (const char *p = buf; *p && count < CfgwMax && !err;) {
 		Cfgw c {};
-		const uint32_t bus = hexField(p, ':'), dev = hexField(p, '.'), fn = hexField(p, ':');
-		c.off = (uint16_t)(hexField(p, '=') & 0xFFC);
-		c.value = hexField(p, '/');
-		c.mask = hexField(p, ',');
-		if (bus > 0xFF || dev > 0x1F || fn > 7 || !c.mask) return EINVAL;
-		c.bdf = (uint16_t)((bus << 8) | (dev << 3) | fn);
+		const char *begin = p;
+		uint64_t phys;
+		if (*p == 'm' || *p == 'M') {
+			p++;
+			phys = hexField64(p, "=,");
+		} else {
+			const uint64_t bus = hexField64(p, ":"); if (*p == ':') p++;
+			const uint64_t dev = hexField64(p, "."); if (*p == '.') p++;
+			const uint64_t fn = hexField64(p, ":"); if (*p == ':') p++;
+			const uint64_t off = hexField64(p, "=,");
+			if (!ecam || (ecam & 0xFFFFF) || bus > 0xFF || dev > 0x1F || fn > 7 || off > 0xFFC) { err = EINVAL; break; }
+			phys = ecam + (((bus << 8) | (dev << 3) | fn) << 12) + (off & 0xFFC);
+		}
+		if (*p == '=') {
+			p++;
+			c.write = true;
+			c.value = (uint32_t)hexField64(p, "/,");
+			if (*p == '/') { p++; c.mask = (uint32_t)hexField64(p, ","); } else c.mask = 0xFFFFFFFFU;
+			if (!c.mask) { err = EINVAL; break; }
+		}
+		const size_t len = (size_t)(p - begin);
+		strlcpy(c.label, begin, len + 1 < sizeof(c.label) ? len + 1 : sizeof(c.label));
+		if (*p == ',') p++;
+		c.reg = mapDword(phys, &c.map);
+		if (!c.reg || (*c.reg == 0xFFFFFFFFU && !(*begin == 'm' || *begin == 'M'))) { if (c.map) c.map->release(); err = ENOENT; break; }
 		parsed[count++] = c;
 	}
-	// Map the new pages first, then swap; old maps are released after.
-	for (unsigned i = 0; i < count; i++) {
-		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(ecam + ((uint64_t)parsed[i].bdf << 12), 4096, kIODirectionInOut);
-		IOMemoryMap *m = md ? md->map(kIOMapInhibitCache) : nullptr;
-		if (md) md->release();
-		if (!m || !m->getVirtualAddress() || *reinterpret_cast<volatile uint32_t *>(m->getVirtualAddress()) == 0xFFFFFFFFU) {
-			if (m) m->release();
-			for (unsigned j = 0; j < i; j++) parsed[j].map->release();
-			return ENOENT;
-		}
-		parsed[i].map = m;
-		parsed[i].cfg = reinterpret_cast<volatile uint8_t *>(m->getVirtualAddress());
-	}
+	if (err) { for (unsigned j = 0; j < count; j++) parsed[j].map->release(); return err; }
 	Cfgw old[CfgwMax];
 	const unsigned oldCount = cfgwCount;
 	for (unsigned i = 0; i < oldCount; i++) old[i] = cfgw[i];
 	cfgwCount = 0;
-	for (unsigned i = 0; i < count; i++) cfgw[i] = parsed[i];
+	bool any = false;
+	for (unsigned i = 0; i < count; i++) { cfgw[i] = parsed[i]; any |= parsed[i].write; }
+	cfgwAnyWrite = any;
 	cfgwCount = count;
 	for (unsigned i = 0; i < oldCount; i++) old[i].map->release();
 	strlcpy(cfgwText, buf, sizeof(cfgwText));
+	return 0;
+}
+char cfgrText[1024];
+int cfgrHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	size_t u = 0;
+	cfgrText[0] = '\0';
+	for (unsigned i = 0; i < cfgwCount && u + 80 < sizeof(cfgrText); i++) {
+		const Cfgw &c = cfgw[i];
+		u += (size_t)snprintf(cfgrText + u, sizeof(cfgrText) - u, "%s: before=%08x enter=%08x exit=%08x now=%08x\n",
+			c.label, c.write ? c.saved : c.atEnter, c.atEnter, c.atExit, *c.reg);
+	}
+	return sysctl_handle_string(oidp, cfgrText, sizeof(cfgrText), req);
+}
+// Immediate MMIO access (debug.s0ix.mmio, for experiments): write "ADDR" to select a physical dword, "ADDR=value/mask"
+// to change it now; reading returns the selected address and its value.
+IOMemoryMap *mmioMap = nullptr;
+volatile uint32_t *mmioReg = nullptr;
+uint64_t mmioPhys = 0;
+char mmioText[64];
+int mmioHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	if (mmioReg) snprintf(mmioText, sizeof(mmioText), "%llx=%08x", mmioPhys, *mmioReg);
+	else strlcpy(mmioText, "-", sizeof(mmioText));
+	char buf[64];
+	strlcpy(buf, mmioText, sizeof(buf));
+	const int error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error || !req->newptr) return error;
+	const char *p = buf;
+	const uint64_t phys = hexField64(p, "=");
+	if (!phys) return EINVAL;
+	if (!mmioReg || (phys & ~0xFFFULL) != (mmioPhys & ~0xFFFULL)) {
+		IOMemoryMap *m = nullptr;
+		volatile uint32_t *r = mapDword(phys, &m);
+		if (!r) return ENOENT;
+		if (mmioMap) mmioMap->release();
+		mmioMap = m;
+	}
+	mmioPhys = phys & ~3ULL;
+	mmioReg = reinterpret_cast<volatile uint32_t *>(mmioMap->getVirtualAddress() + (mmioPhys & 0xFFF));
+	if (*p == '=') {
+		p++;
+		const uint32_t v = (uint32_t)hexField64(p, "/");
+		uint32_t mask = 0xFFFFFFFFU;
+		if (*p == '/') { p++; mask = (uint32_t)hexField64(p, ""); }
+		*mmioReg = (*mmioReg & ~mask) | (v & mask);
+	}
 	return 0;
 }
 int pciDiagHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) {
@@ -1102,7 +1170,9 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, ec_replay, CTLTYPE_INT | CTLFLAG_RW, nullptr,
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pmcDiagHandler, "I", "1 = PCH PMC snapshots around sleep");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC registers (live/start/end)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pciDiagHandler, "I", "1 = PCI power/link snapshot inside each sleep");
-SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgw, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, cfgwHandler, "A", "PCI config writes inside the wait, restored at wake: bb:dd.f:off=value/mask,... (hex)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgw, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, cfgwHandler, "A", "register writes/reads inside the wait: bb:dd.f:off or mADDR, =value/mask to write (hex)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgr, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, cfgrHandler, "A", "cfgw entries: values before, at the start and at the end of the last wait");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, mmio, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, mmioHandler, "A", "physical dword: ADDR selects, ADDR=value/mask writes now (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pciHandler, "A", "PCI D-state, ASPM, LTR enable and L1 substates (sleep/live)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, batt_refresh, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, battHandler, "I", "1 = battery re-read after wake and boot");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, safety, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, safetyHandler, "I", "wake after N s (0 never)");
@@ -1157,6 +1227,8 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_pci_diag);
 	sysctl_register_oid(&sysctl__debug_s0ix_pci);
 	sysctl_register_oid(&sysctl__debug_s0ix_cfgw);
+	sysctl_register_oid(&sysctl__debug_s0ix_cfgr);
+	sysctl_register_oid(&sysctl__debug_s0ix_mmio);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_batt_refresh);
 	sysctl_register_oid(&sysctl__debug_s0ix_gtreset);
