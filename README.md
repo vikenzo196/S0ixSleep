@@ -197,9 +197,12 @@ Some embedded controllers report a wrong remaining capacity for a few seconds af
 minute after boot). The battery driver (SMCBatteryManager) reads the battery once a minute, so a reading taken in
 that window can stay on screen for a minute, or until the next wake if the machine went back to sleep. The kext
 therefore sends a battery notification (0x80) to the ACPI battery 5, 15, 30 and 60 s after each wake and every
-15 s during the first 4 minutes after boot, so the driver reads it again. `batt=` in the status shows
-enabled/batteries found/notifications sent; `debug.s0ix.batt_refresh=0` or the boot argument `s0ixbatt=0`
-turns it off.
+15 s during the first 4 minutes after boot, so the driver reads it again. Dark wakes count too: macOS sends them
+neither `WillPowerOn` nor `HasPoweredOn`, only a system capability change, so the re-read also starts on a
+capability change that adds capabilities (the ones on the way down to sleep are ignored). `batt=` in the status
+shows enabled/batteries found/notifications sent, `battmsg=` how many WillPowerOn/HasPoweredOn/capability change
+messages arrived and `battcap=` the last capability change (from, to, flags); `debug.s0ix.batt_refresh=0` or the
+boot argument `s0ixbatt=0` turns it off.
 
 ### PCIe L1.2 in sleep
 

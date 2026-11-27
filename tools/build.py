@@ -8,7 +8,7 @@ import argparse, plistlib, subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NAME, VERSION, IDENT = 'S0ixSleep', '0.1.5', 'io.github.vikenzo196.S0ixSleep'
+NAME, VERSION, IDENT = 'S0ixSleep', '0.1.6', 'io.github.vikenzo196.S0ixSleep'
 
 
 def run(cmd):
