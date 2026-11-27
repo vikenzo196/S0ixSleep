@@ -730,6 +730,23 @@ void ishWork(thread_call_param_t, thread_call_param_t) {
 	if (f == 0xFFFFFFFFU || (f & 3) != 3) ishHandshake();
 }
 
+// 8254 PIT channel 0 (debug.s0ix.pit / PIT_STOP). Firmware leaves it counting in mode 3 (18.2 Hz). On recent Intel PCHs
+// the 8254 lives in the ITSS, and a counting 8254 keeps the ITSS clock source request (LPM requirement "ITSS clock
+// source request" on Meteor Lake, an unnamed vnn_misc bit on Alder Lake) asserted, so the chipset cannot reach its low
+// power mode. macOS never uses the PIT once the TSC deadline timer runs, and with the HPET legacy replacement route set
+// its interrupt is not even delivered. Stopping it as Linux does (mode 0, count 0: one shot that ends) is harmless.
+int pitStop = 0;
+uint32_t pitStops = 0;
+uint8_t pitStatusBefore = 0xFF, pitStatusAfter = 0xFF;
+uint8_t pitStatus() { outb(0x43, 0xE2); return inb(0x40); }   // read-back command: status of counter 0
+void pitHalt() {
+	pitStatusBefore = pitStatus();
+	outb(0x43, 0x30);   // counter 0, lobyte/hibyte, mode 0 (interrupt on terminal count)
+	outb(0x40, 0); outb(0x40, 0);
+	pitStatusAfter = pitStatus();
+	pitStops++;
+}
+
 // ─── MWAIT wait: APIC timer and IDT ────────────────────────────────────────────────────────────
 constexpr uint8_t TimerVector = 0xF2, SpuriousVector = 0xFF;
 alignas(4096) uint8_t idtCopy[4096];
@@ -1092,6 +1109,7 @@ IOReturn sleepInterest(void *, void *, UInt32 type, IOService *, void *, vm_size
 	if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) ishShutdown();
 	if (type == kIOMessageSystemWillSleep && battCall) { __atomic_store_n(&battLeft, 0U, __ATOMIC_RELEASE); thread_call_cancel(battCall); }
 	if (type == kIOMessageSystemHasPoweredOn) battStart(4, 0, 5);
+	if (type == kIOMessageSystemHasPoweredOn && pitStop && (pitStatus() & 0x0E) != 0) pitHalt();   // counting again: stop
 	if (type == kIOMessageSystemHasPoweredOn && ishWake && ishCall) {
 		uint64_t deadline;
 		clock_interval_to_deadline(3, kSecondScale, &deadline);
@@ -1187,6 +1205,15 @@ int ishHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		thread_call_enter_delayed(ishCall, deadline);
 	}
 	return ok ? 0 : EIO;
+}
+int pitHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = pitStop;
+	const int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || !req->newptr) return error;
+	if (value != 0 && value != 1) return EINVAL;
+	pitStop = value;
+	if (value) pitHalt();
+	return 0;
 }
 int periodHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &periodMs, 5, 1000, r); }
 int replayHandler(struct sysctl_oid *o, void *, int, struct sysctl_req *r) { return intHandler(o, &ecReplay, 0, 1, r); }
@@ -1451,13 +1478,13 @@ int statHandler(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
 		" sleeps=%u reason=0x%x loops=%llu ms=%llu pkg_mw=%llu core_mw=%llu psys_mw=%llu hwp=0x%llx gpe_en=%s"
 		" ec_ign=%u ec_q=%x,%x,%x,%x userwake=%u gt=%d/0x%x hooks=%u/%u"
 		" mwait=%u period_ms=%d timer_irqs=%u core_c7_ms=%llu apic_found=0x%llx mwait_fail=%u"
-		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u l12=%u/%u/%u ish=%d/%u/%u/0x%x",
+		 " pc=2:%u,3:%u,6:%u,7:%u,8:%u,9:%u,10:%u res_ok=0x%x ec_replay=%d replayed=%u/%u wake_gpe=%s gpe_sts=%s>%s lid_ec=%s lid=%d>%d/%u batt=%d/%u/%u cfgw=%u/%u l12=%u/%u/%u ish=%d/%u/%u/0x%x pit=%d/%u/0x%x>0x%x/0x%x",
 		route, enabled, platformReady, lps0, pm1Sts, gpe0Sts, gpe0Bytes, ecCmd, ecData, ecGpe, kbc, intel, hwpCap, waitPkg, tscPerMs,
 		shared.sleeps, lastReason, lastLoops, lastMs, lastPkgMw, lastCoreMw, lastPsysMw, lastHwp, en,
 		ecIgnored, ecLast[0], ecLast[1], ecLast[2], ecLast[3], userWakes, gtReset, gtResult, hookCount, hookCalls,
 		lastMwait, periodMs, mwaitIrqs, coreC7Ms, apicFound, mwaitFail,
 		resPm[0], resPm[1], resPm[2], resPm[3], resPm[4], resPm[5], resPm[6], resOk, ecReplay, replayedLast, replayedTotal,
-		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, cfgwCount, cfgwApplied, l12Count, l12Applied, l12Skipped, ishWake, ishRuns, ishOk, ishLast);
+		wakeGpeText[0] ? wakeGpeText : "-", s0, s1, lidText, lidEntry, lidLast, lidErrors, battRefresh, batteryCount, battNotifies, cfgwCount, cfgwApplied, l12Count, l12Applied, l12Skipped, ishWake, ishRuns, ishOk, ishLast, pitStop, pitStops, pitStatusBefore, pitStatusAfter, pitStatus());
 	return sysctl_handle_string(oidp, statText, sizeof(statText), req);
 }
 
@@ -1472,6 +1499,7 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, pmcHandler, "A", "PCH PMC registers (live/start/end)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pci_diag, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pciDiagHandler, "I", "1 = PCI power/link snapshot inside each sleep");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgw, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, cfgwHandler, "A", "register writes/reads inside the wait: bb:dd.f:off or mADDR, =value/mask to write (hex)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, pit, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, pitHandler, "I", "1 = stop 8254 PIT counter 0 now and after each wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, ish, CTLTYPE_INT | CTLFLAG_RW, nullptr, 0, ishHandler, "I", "1 = bring the ISH firmware up (reset handshake) now and after each wake");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, l12, CTLTYPE_STRING | CTLFLAG_RW, nullptr, 0, l12Handler, "A", "root ports whose link goes to PCI-PM L1.2 in sleep: bb:dd.f,... (hex)");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cfgr, CTLTYPE_STRING | CTLFLAG_RD, nullptr, 0, cfgrHandler, "A", "cfgw entries: values before, at the start and at the end of the last wait");
@@ -1534,6 +1562,7 @@ void S0ix::install(KernelPatcher &patcher) {
 	sysctl_register_oid(&sysctl__debug_s0ix_cfgr);
 	sysctl_register_oid(&sysctl__debug_s0ix_l12);
 	sysctl_register_oid(&sysctl__debug_s0ix_ish);
+	sysctl_register_oid(&sysctl__debug_s0ix_pit);
 	sysctl_register_oid(&sysctl__debug_s0ix_mmio);
 	sysctl_register_oid(&sysctl__debug_s0ix_safety);
 	sysctl_register_oid(&sysctl__debug_s0ix_batt_refresh);
